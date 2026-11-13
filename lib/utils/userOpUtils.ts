@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 import type { UserOperation, PackedUserOperation, PimlicoUserOperation } from "../types/UserOperation";
 import { AaOperationError, AaOperationErrorCode } from "../errors";
+import { MASTER_OP_KEY_INDEX_LIST } from "../master/constants";
 
 // ---------------------------------------------------------------------------
 // Pack / Unpack UserOperation
@@ -200,7 +201,11 @@ const DUMMY_PROOF_8: bigint[] = [MAX, MAX, MAX, MAX, MAX, MAX, MAX, MAX];
 
 /**
  * Create a dummy ZK signature for gas estimation.
- * @param n - 1 for 1-of-1 (deploy signature), 3 for 3-of-3 (recovery / updateKeys)
+ *
+ * This is only the zk entry of `keySignatureList`. Master key operations (`updateKeys`,
+ * `updateMasterKey`, `updateTxKey`) are cosigned, so use `createDummyMasterOpSignature`
+ * for their full signature instead.
+ * @param n - 1 for a single proof (the 1-of-1 key), 3 for 3 proofs (the 3-of-6 key)
  * @returns ABI-encoded dummy ZK proof string (the keySignatureList entry)
  */
 export function createDummyZkSignature(n: number): string {
@@ -233,6 +238,57 @@ export function createDummyPasskeySignature(): string {
       ethers.MaxUint256,       // challengeIndex
       ethers.MaxUint256,       // originIndex (originStart)
       ethers.MaxUint256,       // originLength
+    ]
+  );
+}
+
+/**
+ * Fixed 65-byte ECDSA signature (`r ‖ s ‖ v`) used as the cosigner's dummy signature.
+ * It is a real low-s signature (private key 1 over the zero hash), so ECDSA recovery
+ * succeeds and returns an unrelated address instead of reverting on a malformed
+ * signature during estimation.
+ */
+const DUMMY_COSIGN_SIGNATURE =
+  "0xa0b37f8fba683cc68f6574cd43b39f0343a50008bf6ccea9d13231d9e7e2e1e4" +
+  "11edc8d307254296264aebfc3dc76cd8b668373a072fd64665b50000e9fcce52" +
+  "1c";
+
+/**
+ * Create a dummy cosigner (address key) signature for gas estimation.
+ * @returns 65-byte hex signature (the keySignatureList entry of the cosigner key)
+ */
+export function createDummyCosignSignature(): string {
+  return DUMMY_COSIGN_SIGNATURE;
+}
+
+/**
+ * Create a full dummy signature for a cosigned master op (`updateKeys` and the other
+ * master key operations): `abi.encode(uint8[] [0, 1], bytes[] [zkSignature, cosignerSignature])`.
+ *
+ * These are the finished `UserOperation.signature` bytes: use them when you assemble
+ * a UserOperation yourself, or as a reference for the length and bytes of the
+ * signature. `ZkapBuilder.setSignature` takes the index and signature lists instead
+ * and encodes them itself; there,
+ * `setSignature([...MASTER_OP_KEY_INDEX_LIST], [createDummyZkSignature(n), createDummyCosignSignature()])`
+ * produces these same bytes.
+ * @param proofCount - 1 for the initial master key (1-of-1 zk key), 3 for the
+ *   operational master key (3-of-6 zk key, three proofs)
+ * @returns ABI-encoded signature, 1120 bytes for one proof and 1760 bytes for three
+ * @throws `AaOperationError` (`INPUT_OUT_OF_RANGE`) when `proofCount` is not 1 or 3
+ */
+export function createDummyMasterOpSignature(proofCount: 1 | 3): string {
+  if (proofCount !== 1 && proofCount !== 3) {
+    throw new AaOperationError({
+      code: AaOperationErrorCode.INPUT_OUT_OF_RANGE,
+      operation: "create_dummy_master_op_signature",
+      message: `proofCount must be 1 or 3, got ${String(proofCount)}`,
+    });
+  }
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["uint8[]", "bytes[]"],
+    [
+      [...MASTER_OP_KEY_INDEX_LIST],
+      [createDummyZkSignature(proofCount), createDummyCosignSignature()],
     ]
   );
 }

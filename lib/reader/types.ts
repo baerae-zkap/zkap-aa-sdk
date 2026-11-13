@@ -56,19 +56,90 @@ export interface TxKeyInfo {
 }
 
 /**
- * Summary of the master key configuration for a ZkapAccount.
+ * ZK-OAuth key data as stored by `AccountKeyZkOAuthRS256Verifier`
+ * (`getData` + `getAnchor`).
+ */
+export interface OnchainZkKeyData {
+  /** Merkle tree directory the verifier resolves JWKS roots from. */
+  directory: string;
+  /** Number of anchor (identity) slots. */
+  n: bigint;
+  /** Number of proofs required out of `n`. */
+  k: bigint;
+  /** Hash of the allowed audience list. */
+  hAudList: bigint;
+  /** Raw getAnchor() return: the registered anchor elements followed by their on-chain hash. */
+  anchorWithHash: bigint[];
+}
+
+/**
+ * One key of a ZkapAccount key list (master or tx), with the data its logic
+ * contract holds for it. Exactly the field matching `keyType` is set:
+ * `zk` for `"zkOAuth"`, `signer` for `"address"`, `webauthn` for `"webauthn"`;
+ * none for any other type.
+ */
+export interface OnchainKeyEntry {
+  /** Zero-based position in the account's key list. */
+  index: number;
+  /** Address of the key logic singleton contract. */
+  logicContract: string;
+  /** Key ID within the logic contract. */
+  keyId: bigint;
+  /** Weight of this key towards the list's threshold. */
+  weight: number;
+  /** Scheme reported by the logic contract's `keyType()`. */
+  keyType: KeyType;
+  zk?: OnchainZkKeyData;
+  /** Signer address of an `"address"` key. */
+  signer?: string;
+  webauthn?: WebAuthnKeyData;
+}
+
+/** One key list of a ZkapAccount (master or tx). */
+export interface OnchainKeySet {
+  /** Sum of weights required. `0` for an undeployed account. */
+  threshold: number;
+  /** Keys in list order. */
+  keys: OnchainKeyEntry[];
+  /**
+   * `true` when the list continues past the read window — `keys` is then not
+   * the whole list and must not be treated as such.
+   */
+  truncated: boolean;
+}
+
+/**
+ * Both key lists of a ZkapAccount, read from one consistent state.
+ */
+export interface OnchainKeyState {
+  /**
+   * The account that was read, checksummed. Anything derived from this state
+   * (e.g. a rebuilt master key) applies to this account only.
+   */
+  account: string;
+  /** `false` for an address without code (counterfactual account); both sets are then empty. */
+  deployed: boolean;
+  master: OnchainKeySet;
+  tx: OnchainKeySet;
+  /** Which transport path served the read. */
+  readVia: ReadVia;
+}
+
+/**
+ * The master key list of a ZkapAccount. Same data as `OnchainKeyState.master`,
+ * flattened with `account`, `deployed` and `readVia`.
  */
 export interface MasterKeyInfo {
-  /** Number of signatures required to authorize a master-key operation. */
+  /** The account that was read, checksummed. */
+  account: string;
+  /** `false` for an address without code; `threshold` is then `0` and `keys` empty. */
+  deployed: boolean;
+  /** Sum of weights required to authorize a master-key operation. */
   threshold: number;
-  /** Total number of master key shares detected (1 or 3). */
-  keyCount: number;
-  /** `true` when the account uses a 3-of-3 threshold master key scheme. */
-  is3of3: boolean;
-  /** ZK circuit anchor values (Poseidon hashes) for each master key share. */
-  anchor: string[];
-  /** Address of the ZkOAuth verifier contract that holds the master key data. */
-  verifierAddress: string;
+  keys: OnchainKeyEntry[];
+  /** See {@link OnchainKeySet.truncated}. */
+  truncated: boolean;
+  readVia: ReadVia;
 }
 
 /**

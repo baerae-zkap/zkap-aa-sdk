@@ -156,6 +156,8 @@ const address = await creator.deriveZkapAddress(); // factory.calcAccountAddress
 
 `ZkapCreator` extends `ZkapBuilder`, and `deriveZkapAddress()` has already set both `initCode` and `sender` — so the same instance sends the wallet's first UserOp, and that op deploys it. Use `ZkapCreator` for the first op and plain `ZkapBuilder` after that.
 
+A ZKAP wallet with a zk key is deployed with the **initial cosigned master key** instead — build it with `buildInitialMasterKey` and pass that as `encodedMasterKey`. See [Cosigned master key](#cosigned-master-key).
+
 ## Signers
 
 ### AddressKeySigner
@@ -369,15 +371,22 @@ result.readVia               // "multicall" | "direct" — "direct" on a chain t
 ```typescript
 import { rpIdHashOf } from '@baerae/zkap-aa';
 
-await reader.readTxKeySlots(WALLET_ADDRESS); // { deployed, keys, truncated, readVia }
-await reader.getTxKeyList(WALLET_ADDRESS);   // keys only — [] for an undeployed account
-await reader.getMasterKeyInfo(WALLET_ADDRESS);
+await reader.readTxKeySlots(WALLET_ADDRESS);   // { deployed, keys, truncated, readVia }
+await reader.getTxKeyList(WALLET_ADDRESS);     // keys only — [] for an undeployed account
+await reader.getMasterKeyInfo(WALLET_ADDRESS); // { account, deployed, threshold, keys, truncated, readVia }
+await reader.readKeyState(WALLET_ADDRESS);     // master and tx lists from one consistent state
 
 // WebAuthn keys registered for one relying party
 await reader.findTxKeysByRpId(WALLET_ADDRESS, rpIdHashOf('zkap.app'));
 ```
 
-Both txKey reads throw `AaFetchError` — `TRANSPORT` when the node cannot be reached, `RESPONSE_SHAPE` when it answers with undecodable data. An empty array means the account has no keys, never that the RPC failed. Note the asymmetry on an **undeployed** account: `getTxKeyList` returns `[]`, while `getMasterKeyInfo` throws `AaFetchError`. Use `readTxKeySlots().deployed` (or `isDeployed()` where available) to tell "no keys" apart from "no wallet".
+A key list ends at the first index whose getter **reverts without data** — what the account's public array getters answer past the end of the list — or reverts with `Panic(0x32)` (array index out of bounds). The two paths differ at a slot that holds the zero address: `readTxKeySlots` (and `getTxKeyList`, `getPasskeys`, `findTxKeysByRpId`) ends its list there, while `readKeyState` (and `getMasterKeyInfo`, `classifyMasterKey`) throws, because it reads every listed key's logic contract. Any other failed slot throws instead of ending the list: `AaFetchError` — `TRANSPORT` when the node cannot be reached, `RESPONSE_SHAPE` when it answers with undecodable data, with other revert data (`Error(string)`, another `Panic`), or with a failure that carries no revert data at all (a node error, such as a rate limit, on the per-call path). An empty array means the account has no keys, never that the RPC failed.
+
+On a chain without Multicall3 the reader calls each getter on its own, and tells a revert from a node error through the error ethers throws: a revert carries its revert data in `err.data` (`"0x"` when there is none), a node error has `err.data === null`. That holds for a node that answers a data-less revert with `data: "0x"` (checked against a local anvil node); a node that omits the `data` field for such a revert looks like a node error here, and every key list read on this path then throws rather than returning a short list. Chains with Multicall3 are not affected. A custom `isRevertError` must keep that distinction — return `true` only for a contract revert and pass the revert data through as the error's `data` — or every list end reads as a failure (data dropped) or a node error reads as a list end (`data: "0x"` invented). Reverts are routine on this path: `readKeyState` asks each key's logic contract for the getters of every key type, and the ones that do not match its type revert.
+
+On an **undeployed** account `getTxKeyList` returns `[]`, and `getMasterKeyInfo` resolves with `deployed: false`, `threshold: 0` and no keys. Check `deployed` (on `readTxKeySlots()`, `getMasterKeyInfo()` or `readKeyState()`) to tell "no keys" apart from "no wallet".
+
+`getMasterKeyInfo` returns the same data as `readKeyState().master`: every master key as an `OnchainKeyEntry` — `logicContract`, `keyId`, `weight`, `keyType`, and the data its logic contract holds (`zk`, `signer` or `webauthn`, matching `keyType`). `zk.anchorWithHash` is the verifier's `getAnchor()` return: the registered anchor followed by one on-chain hash. Master keys are read over a window of 5, txKeys over `maxTxKeys`; `truncated: true` means the list continues past it.
 
 ### Public key formats
 
@@ -389,6 +398,242 @@ toJwkPublicKey({ x, y });         // { kty: 'EC', crv: 'P-256', x, y } with base
 rpIdHashOf('zkap.app');           // sha256(rpId)      — what the chain stores as allowedRpIdHash
 originHashOf('https://zkap.app'); // keccak256(origin) — what the chain stores as allowedOriginHash (keccak, not SHA-256)
 ```
+
+## Cosigned master key
+
+A ZKAP wallet's master key pairs the zk key with the service's cosigner key — an address key — so every master key operation (`updateKeys`, `updateMasterKey`, `updateTxKey`) carries two signatures. The SDK builds, parses and reads two fixed layouts:
+
+| Layout | `[0]` zk key | `[1]` cosigner (address key) | `[2]` passkey | Threshold |
+|---|---|---|---|---|
+| Initial — installed at deployment (`INITIAL_MASTER_KEY`) | 1-of-1, weight 1 | weight 1 | — | 2 |
+| Operational — installed by onboarding (`OPERATIONAL_MASTER_KEY`) | 3-of-6, weight 2 | weight 1 | weight 1, `requireUV = false` | 3 |
+
+The initial key needs both signatures. The operational key is satisfied by zk + cosigner or zk + passkey. The positions are exported as `MASTER_KEY_INDEX` (`{ zk: 0, cosigner: 1, passkey: 2 }`).
+
+### Building the keys
+
+```typescript
+import {
+  buildInitialMasterKey,
+  buildOperationalMasterKey,
+  buildPasskeyTxKey,
+  rpIdHashOf,
+  type PasskeyKeyInput,
+} from '@baerae/zkap-aa';
+
+const contracts = {
+  zkVerifier1of1: '0x…',      // zk verifier deployed for the 1-of-1 parameters
+  zkVerifier3of6: '0x…',      // zk verifier deployed for the 3-of-6 parameters
+  addressKeyLogic: '0x…',
+  webAuthnLogic: '0x…',
+  merkleTreeDirectory: '0x…',
+};
+const COSIGNER = '0x…';       // the service's cosigner address
+
+// Computed by your backend — this package does not compute hAudList or the anchor.
+const initialZk = { hAudList: '0x…', anchor: ['0x…'] };                       // 1 anchor element
+const operationalZk = { hAudList: '0x…', anchor: ['0x…', '0x…', '0x…', '0x…'] }; // 4 anchor elements
+
+// A passkey, in either form. Both encode to the same bytes.
+const passkey: PasskeyKeyInput = {
+  credentialPubkey: '0x…',              // COSE_Key bytes from the WebAuthn registration
+  credentialId,                         // base64url, as the authenticator returned it
+  origin: 'https://wallet.example.com',
+  rpId: 'wallet.example.com',           // hashed here with SHA-256
+};
+const samePasskey: PasskeyKeyInput = {
+  x: '0x…', y: '0x…',                   // 32-byte P-256 coordinates
+  credentialId,
+  origin: 'https://wallet.example.com',
+  rpIdHash: rpIdHashOf('wallet.example.com'),
+};
+
+const initialMasterKey = buildInitialMasterKey({ contracts, zk: initialZk, cosigner: COSIGNER });
+const operationalMasterKey = buildOperationalMasterKey({ contracts, zk: operationalZk, cosigner: COSIGNER, passkey });
+const passkeyTxKey = buildPasskeyTxKey({ contracts, passkey });
+```
+
+Each builder takes only the contract addresses its layout uses; extra fields in `contracts` are ignored. Input rules — a violation throws `AaOperationError` instead of encoding a key that cannot sign:
+
+- Addresses must be well-formed and non-zero.
+- Numbers (`hAudList`, anchor elements) are a `bigint`, a `0x`-prefixed hex string or a decimal string of digits only. JS numbers and hex without `0x` are rejected. Each must be below the BN254 scalar field size, and `hAudList` must be non-zero.
+- The anchor has exactly 1 element for the initial key and 4 for the operational key.
+- A passkey has exactly one public key form (`credentialPubkey`, or `x` and `y`) and `rpId`, `rpIdHash` or both — given both, `rpIdHash` must equal `sha256(rpId)`. `rpId` is a bare host name (`wallet.example.com`); a value with `/` or `:` — an origin — is rejected. `credentialId` and `origin` are non-empty. User verification is never required: `requireUV` is always encoded as `false`, and may be passed only as `false`.
+
+`encodePasskeyKeyInitData(passkey)` returns the passkey's init data alone — the same bytes the operational key's `[2]` and the passkey tx key carry.
+
+> **`TxKeyHelper` encodes passkeys differently.** It registers a new key with `requireUV = true` unless told otherwise, and always re-encodes existing keys with `requireUV = true` (the chain does not expose the flag). Its output therefore differs from `buildPasskeyTxKey` and from the passkey entry of the operational master key. Use `buildPasskeyTxKey` for the tx key that goes with the operational master key.
+
+The strict parsers `parseInitialMasterKey`, `parseOperationalMasterKey` and `parsePasskeyTxKey` read a blob back and throw unless it has the layout's shape and the builder reproduces it byte for byte. They do not check which contracts or cosigner it names — compare the returned values yourself. `decodeKeySet` decodes any key set without a shape check.
+
+### Deploying with the initial master key
+
+The initial master key is part of the wallet address (`CREATE2(salt, encodedMasterKey, encodedTxKey)`), so derive the address from the builder's output and deploy with exactly the same bytes. The wallet's first op typically installs the operational master key and the passkey tx key with `updateKeys`, signed by the initial master key:
+
+```typescript
+import {
+  ZkapCreator,
+  MASTER_OP_KEY_INDEX_LIST,
+  createDummyZkSignature,
+  createDummyCosignSignature,
+} from '@baerae/zkap-aa';
+
+const creator = new ZkapCreator({
+  chainId: CHAIN.chainId,
+  entryPoint: CHAIN.entryPoint,
+  zkapFactory: CHAIN.zkapFactory,
+  enUrl: CHAIN.rpcUrl,
+  salt,
+  encodedMasterKey: initialMasterKey,
+  encodedTxKey: '0x',
+});
+const address = await creator.deriveZkapAddress();
+
+creator.setUpdateKeysCallData({ encodedMasterKey: operationalMasterKey, encodedTxKey: passkeyTxKey });
+
+// Dummy with the real signature's shape: the initial key's zk signature carries 1 proof.
+creator.setSignature([...MASTER_OP_KEY_INDEX_LIST], [createDummyZkSignature(1), createDummyCosignSignature()]);
+await creator.autoFillUserOp();
+creator.applyBundlerPreVerificationGas();
+
+const userOpHash = creator.getUserOpHash();
+const [zkSignature] = await zkSigner.signUserOpHash(userOpHash); // ZkOidcSigner, 1-proof data
+const cosignerSignature = await requestCosignature(userOpHash);  // your service's cosigner, 65 bytes
+creator.setSignature([...MASTER_OP_KEY_INDEX_LIST], [zkSignature, cosignerSignature]);
+```
+
+### Master op signatures
+
+- Key indices are `MASTER_OP_KEY_INDEX_LIST` (`[0, 1]`): the zk signature first, then the cosigner's 65-byte ECDSA signature over `userOpHash` (the format `AddressKeySigner` produces). The full signature is 1120 bytes with one proof (initial key) and 1760 bytes with three (operational key) — `MASTER_OP_SIGNATURE_LENGTH`.
+- Put in only the signatures of the keys needed to reach the threshold. A well-formed signature from the wrong signer only fails to count, but a **malformed** one — an ECDSA signature of the wrong length, an undecodable or invalid proof — makes verification revert, and the whole op fails even when the other signatures would reach the threshold.
+- To sign the operational key with zk + passkey instead, use indices `[0, 2]` and pass `[PrimitiveAccountKeyTypes.keyZkOAuthRS256, PrimitiveAccountKeyTypes.keyWebAuthn]` as the setter's second argument. Keep the zk key first in both lists.
+- `setSignature` throws when the two lists differ in length or `keyIndexList` repeats an index.
+
+### Dummy signature and gas
+
+- `setUpdateKeysCallData`, `setUpdateMasterKeyCallData` and `setUpdateTxKeyCallData` set the signer key types to `[keyZkOAuthRS256, keyAddress]` (`MASTER_OP_SIGNER_KEY_TYPES`) unless you pass a second argument. For a wallet whose master key is still a zk key alone, pass `[PrimitiveAccountKeyTypes.keyZkOAuthRS256]`. The key types decide the `verificationGasLimit` that `autoFillUserOp()` computes.
+- Before `autoFillUserOp()`, install a dummy with the real signature's shape, as above. Its bytes equal `createDummyMasterOpSignature(n)` — `n` is 1 for the initial key, 3 for the operational key. The proof count in the dummy picks the zk verification budget, and its length is what `applyBundlerPreVerificationGas()` calibrates against.
+- `updateKeys` callGasLimit: with initCode (wallet not deployed yet) `ZkapBuilder.UPDATE_KEYS_CALL_GAS + GAS_BUFFER` = 1,825,000; on a deployed wallet the node's estimate × 1.2 + 25,000. Under-declaring reverts the execution on-chain and the op is still charged.
+
+### Classifying a wallet's master key
+
+```typescript
+const expected = { contracts, cosigner: COSIGNER };
+const { kind, reasons, state } = await reader.classifyMasterKey(WALLET_ADDRESS, expected);
+```
+
+| `kind` | Meaning |
+|---|---|
+| `"undeployed"` | No code at the address yet. |
+| `"initial"` | The initial master key with the expected contracts and cosigner, and no tx key — onboarding has not run. |
+| `"operational"` | The operational master key with the expected contracts and cosigner. Tx keys are not looked at. |
+| `"other"` | Anything else, including a truncated read. `reasons` lists every failed condition with its expected and actual value. |
+
+A failed read throws `AaFetchError`; it is never reported as `"other"`. Addresses compare case-insensitively. `"operational"` checks the layout, not every value: such a state can still fail reconstruction when its on-chain anchor or `hAudList` is out of the builder's range. The pure function `classifyMasterKey(state, expected)` classifies a state you read with `readKeyState()`.
+
+### Rebuilding the operational master key
+
+`reconstructOperationalMasterKey` rebuilds a wallet's operational master key with a new passkey at `[2]` — to replace a lost passkey, for example. `hAudList` and the anchor exist only on chain, so it takes them from the read state; contract addresses and the cosigner come from your parameters.
+
+```typescript
+import {
+  AccountReader,
+  ZkapBuilder,
+  buildPasskeyTxKey,
+  MASTER_OP_KEY_INDEX_LIST,
+  createDummyZkSignature,
+  createDummyCosignSignature,
+  type MasterKeyExpectation,
+  type PasskeyKeyInput,
+} from '@baerae/zkap-aa';
+
+// CHAIN: see "Configure your chain".
+const WALLET_ADDRESS = '0x…';  // the wallet whose passkey is replaced
+const COSIGNER = '0x…';        // the service's cosigner address
+const newCredentialId = '…';   // base64url credential id of the new passkey
+
+const reader = new AccountReader({ rpcUrl: CHAIN.rpcUrl, chainId: CHAIN.chainId });
+const contracts = {
+  zkVerifier1of1: '0x…',
+  zkVerifier3of6: '0x…',
+  addressKeyLogic: '0x…',
+  webAuthnLogic: '0x…',
+  merkleTreeDirectory: '0x…',
+};
+const expected: MasterKeyExpectation = { contracts, cosigner: COSIGNER };
+// The replacement passkey, from its WebAuthn registration.
+const newPasskey: PasskeyKeyInput = {
+  credentialPubkey: '0x…',
+  credentialId: newCredentialId,
+  origin: 'https://wallet.example.com',
+  rpId: 'wallet.example.com',
+};
+
+const { encodedMasterKey, state } = await reader.reconstructOperationalMasterKey(WALLET_ADDRESS, {
+  ...expected,
+  passkey: newPasskey,
+});
+
+const builder = new ZkapBuilder({ chainId: CHAIN.chainId, entryPoint: CHAIN.entryPoint, enUrl: CHAIN.rpcUrl });
+builder
+  .setSender(state.account) // the result is valid for this wallet only
+  .setUpdateKeysCallData({ encodedMasterKey, encodedTxKey: buildPasskeyTxKey({ contracts, passkey: newPasskey }) });
+// The operational key's zk signature carries 3 proofs.
+builder.setSignature([...MASTER_OP_KEY_INDEX_LIST], [createDummyZkSignature(3), createDummyCosignSignature()]);
+```
+
+**A wrong blob locks the wallet's master key for good** — it installs a master key no zk proof can satisfy. So:
+
+- It throws `AaOperationError` (`INPUT_INVALID`) unless the state classifies as `"operational"` against your `contracts` and `cosigner`. There are no defaults and no partial matches.
+- The result is valid only for the wallet at `state.account`. Submitted to any other wallet it locks that wallet's master key — check that the op's sender is `state.account`.
+- The result is only as current as the read. Use it right after reading, and re-check the wallet's key state before submitting; that check is yours.
+
+The pure function `reconstructOperationalMasterKey(state, params)` does the same for a state you read with `readKeyState()`.
+
+### Checking your own encoder against the vectors
+
+The package ships known-answer vectors that the account contracts accepted on a local test chain, produced by an encoder independent of this package. Use them to test an implementation of your own (another language, a backend):
+
+CommonJS:
+
+```javascript
+const assert = require('node:assert');
+const vectors = require('@baerae/zkap-aa/fixtures/master-key-cosign-vectors.json');
+
+const { contracts, initialMaster, operationalMaster, cosigner, passkey } = vectors.inputs;
+// passkey carries x, y, credentialId, origin, rpId, rpIdHash (= sha256(rpId)) and requireUV: false.
+
+assert.equal(myEncodeInitialMasterKey(contracts, initialMaster.zk, cosigner), vectors.outputs.initialMaster);
+assert.equal(
+  myEncodeOperationalMasterKey(contracts, operationalMaster.zk, cosigner, passkey),
+  vectors.outputs.operationalMaster,
+);
+```
+
+ES modules:
+
+```javascript
+import assert from 'node:assert';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const vectors = require('@baerae/zkap-aa/fixtures/master-key-cosign-vectors.json');
+// Or, where your Node.js version supports import attributes:
+// import vectors from '@baerae/zkap-aa/fixtures/master-key-cosign-vectors.json' with { type: 'json' };
+
+const { contracts, operationalMaster, cosigner, passkey } = vectors.inputs;
+assert.equal(
+  myEncodeOperationalMasterKey(contracts, operationalMaster.zk, cosigner, passkey),
+  vectors.outputs.operationalMaster,
+);
+```
+
+The SDK's own builders take the vector's records as they are, e.g. `buildOperationalMasterKey({ contracts, zk: operationalMaster.zk, cosigner, passkey })` returns `outputs.operationalMaster`.
+
+- `inputs` — integers are decimal strings, bytes `0x` hex. `contracts` are addresses of the local test deployment: inputs to the encoding, not addresses of any live network.
+- `outputs.initialMaster`, `operationalMaster`, `txKey` — the encoded keys. `reconstructedMaster` and `newTxKey` are the operational key and tx key with `inputs.newPasskey`.
+- `outputs.onchainGetAnchor` — the verifier's `getAnchor()` return for the operational zk key (the anchor, then its on-chain hash). `outputs.walletAddress` — `calcAccountAddress(salt, initialMaster, 0x)` on that deployment. `outputs.signatureLength` — 1120 and 1760.
+- The cosigner and passkeys are fixed, publicly known test keys. Never use them outside tests.
 
 ## Bundler Providers
 

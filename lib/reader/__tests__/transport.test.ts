@@ -1,8 +1,8 @@
 import { ethers } from "ethers";
-import { BatchCaller, ethCallFromProvider, hasValue, MULTICALL3_ADDRESS } from "../transport";
+import { BatchCaller, ethCallFromProvider, hasValue, isArrayOutOfBounds, isListEnd, MULTICALL3_ADDRESS } from "../transport";
 import type { Call3 } from "../transport";
 import { AaFetchError, AaFetchErrorCode } from "../../errors";
-import { coder, encodeAggregate3Results } from "../../__tests__/helpers/fakeEthCall";
+import { coder, encodeAggregate3Results, PANIC_OOB } from "../../__tests__/helpers/fakeEthCall";
 
 const TARGET = "0x" + "11".repeat(20);
 const value = (n: number) => coder.encode(["uint256"], [n]);
@@ -25,6 +25,44 @@ describe("hasValue", () => {
     [{ success: true, returnData: "0x1234" }, true],
   ])("%p → %p", (result, expected) => {
     expect(hasValue(result)).toBe(expected);
+  });
+});
+
+describe("isArrayOutOfBounds", () => {
+  const panic = (code: number) => "0x4e487b71" + coder.encode(["uint256"], [code]).slice(2);
+
+  it("pins Panic(0x32) independently of the fake chain's constant", () => {
+    expect(panic(0x32)).toBe(PANIC_OOB);
+  });
+
+  it.each([
+    ["Panic(0x32)", { success: false, returnData: panic(0x32) }, true],
+    ["Panic(0x32), uppercase hex", { success: false, returnData: "0x" + panic(0x32).slice(2).toUpperCase() }, true],
+    ["a revert without data", { success: false, returnData: "0x" }, false],
+    ["Panic(0x11) (overflow)", { success: false, returnData: panic(0x11) }, false],
+    ["Error(string)", { success: false, returnData: "0x08c379a0" + coder.encode(["string"], ["nope"]).slice(2) }, false],
+    ["Panic(0x32) with trailing bytes", { success: false, returnData: panic(0x32) + "00" }, false],
+    ["the Panic selector alone", { success: false, returnData: "0x4e487b71" }, false],
+    ["a successful call returning the Panic bytes", { success: true, returnData: panic(0x32) }, false],
+  ])("%s", (_label, result, expected) => {
+    expect(isArrayOutOfBounds(result)).toBe(expected);
+  });
+});
+
+describe("isListEnd", () => {
+  const panic = (code: number) => "0x4e487b71" + coder.encode(["uint256"], [code]).slice(2);
+
+  it.each([
+    ["a revert without data (the public array getter past its end)", { success: false, returnData: "0x" }, true],
+    ["Panic(0x32)", { success: false, returnData: panic(0x32) }, true],
+    ["a failure whose revert data never arrived", { success: false, returnData: "0x", revertDataMissing: true as const }, false],
+    ["Panic(0x11) (overflow)", { success: false, returnData: panic(0x11) }, false],
+    ["Error(string)", { success: false, returnData: "0x08c379a0" + coder.encode(["string"], ["nope"]).slice(2) }, false],
+    ["the Panic selector alone", { success: false, returnData: "0x4e487b71" }, false],
+    ["a success with empty data", { success: true, returnData: "0x" }, false],
+    ["a value", { success: true, returnData: value(1) }, false],
+  ])("%s", (_label, result, expected) => {
+    expect(isListEnd(result)).toBe(expected);
   });
 });
 
@@ -137,11 +175,21 @@ describe("BatchCaller", () => {
       expect(results).toEqual([{ success: false, returnData: "0x08c379a0" }]);
     });
 
-    it("maps a revert without data to success:false / 0x", async () => {
-      const call = jest.fn().mockRejectedValue(revert(undefined));
+    it("maps a revert with empty data (err.data === '0x') to success:false / 0x", async () => {
+      const call = jest.fn().mockRejectedValue(revert("0x"));
       const caller = new BatchCaller({ call, multicallAddress: false });
       const { results } = await caller.batch(calls(1), "op");
       expect(results).toEqual([{ success: false, returnData: "0x" }]);
+    });
+
+    it.each([
+      ["null (how ethers reports a node error)", null],
+      ["missing", undefined],
+    ])("marks a failure whose err.data is %s as revertDataMissing", async (_label, data) => {
+      const call = jest.fn().mockRejectedValue(revert(data as string | undefined));
+      const caller = new BatchCaller({ call, multicallAddress: false });
+      const { results } = await caller.batch(calls(1), "op");
+      expect(results).toEqual([{ success: false, returnData: "0x", revertDataMissing: true }]);
     });
 
     it("treats a non-revert error as TRANSPORT", async () => {
@@ -159,7 +207,7 @@ describe("BatchCaller", () => {
         isRevertError: (e) => e instanceof ProxyRevert,
       });
       const { results } = await caller.batch(calls(1), "op");
-      expect(results).toEqual([{ success: false, returnData: "0x" }]);
+      expect(results).toEqual([{ success: false, returnData: "0x", revertDataMissing: true }]);
     });
 
     it("multicallAddress:false starts with multicallAvailable=false", () => {

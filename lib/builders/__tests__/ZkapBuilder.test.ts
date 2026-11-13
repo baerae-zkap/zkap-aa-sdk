@@ -66,6 +66,9 @@ jest.mock('../../types/abi', () => ({
 import { ZkapBuilder, ZkapAccountInfo } from '../ZkapBuilder';
 import { PaymasterMode } from '../../utils/PaymasterService';
 import { ethers } from 'ethers';
+import { AaOperationError, AaOperationErrorCode } from '../../errors';
+import { PrimitiveAccountKeyTypes } from '../../types/AccountKey';
+import { MASTER_OP_SIGNER_KEY_TYPES } from '../../master/constants';
 
 describe('ZkapBuilder', () => {
   const mockAccountInfo: ZkapAccountInfo = {
@@ -213,6 +216,51 @@ describe('ZkapBuilder', () => {
       const userOp = builder.getUserOp();
       expect(userOp.signature).toBeDefined();
     });
+
+    const expectSignatureError = (
+      keyIndexList: number[],
+      keySignatureList: string[],
+      code: string
+    ): void => {
+      const builder = new ZkapBuilder(mockAccountInfo);
+      builder.setSender('0x' + '11'.repeat(20));
+      const before = builder.getUserOp().signature;
+
+      let caught: unknown;
+      try {
+        builder.setSignature(keyIndexList, keySignatureList);
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught).toBeInstanceOf(AaOperationError);
+      expect((caught as AaOperationError).code).toBe(code);
+      expect(builder.getUserOp().signature).toBe(before);
+    };
+
+    it.each([
+      [[0, 1], ['0xSig1']],
+      [[0], ['0xSig1', '0xSig2']],
+      [[], ['0xSig1']],
+    ])('should throw INPUT_OUT_OF_RANGE when lengths differ (%j vs %j)', (indices, sigs) => {
+      expectSignatureError(indices, sigs, AaOperationErrorCode.INPUT_OUT_OF_RANGE);
+    });
+
+    it.each([
+      [[0, 0], ['0xSig1', '0xSig2']],
+      [[1, 0, 1], ['0xSig1', '0xSig2', '0xSig3']],
+    ])('should throw INPUT_INVALID for duplicate indices %j', (indices, sigs) => {
+      expectSignatureError(indices, sigs, AaOperationErrorCode.INPUT_INVALID);
+    });
+
+    it('should accept matching lists with indices in any order', () => {
+      const builder = new ZkapBuilder(mockAccountInfo);
+      builder.setSender('0x' + '11'.repeat(20));
+
+      expect(() => builder.setSignature([1, 0], ['0xCosign', '0xZk'])).not.toThrow();
+      expect(() => builder.setSignature([0, 1], ['0xZk', '0xCosign'])).not.toThrow();
+      expect(builder.getUserOp().signature).toBe('0x' + '0a'.repeat(100));
+    });
   });
 
   describe('setExecuteCallData', () => {
@@ -359,12 +407,14 @@ describe('ZkapBuilder', () => {
       expect(userOp.callData).not.toBe('0x');
     });
 
-    it('should set signer key types to keyZkOAuthRS256', () => {
+    it('should default signer key types to [keyZkOAuthRS256, keyAddress] (zk + cosigner)', () => {
       const builder = new ZkapBuilder(mockAccountInfo);
       builder.setSender('0x' + '11'.repeat(20));
+      builder.setSignerKeyTypes([4]); // overwritten by the setter
 
       builder.setUpdateTxKeyCallData('0x' + 'cc'.repeat(64));
 
+      expect((builder as any).signerKeyTypes).toEqual([6, 1]);
       // Once signerKeyTypes is set, setCallData does not throw
       expect(() => builder.setCallData('0x9999')).not.toThrow();
     });
@@ -409,12 +459,14 @@ describe('ZkapBuilder', () => {
       expect(userOp.callData).not.toBe('0x');
     });
 
-    it('should set signer key types to keyZkOAuthRS256', () => {
+    it('should default signer key types to [keyZkOAuthRS256, keyAddress] (zk + cosigner)', () => {
       const builder = new ZkapBuilder(mockAccountInfo);
       builder.setSender('0x' + '11'.repeat(20));
+      builder.setSignerKeyTypes([4]); // overwritten by the setter
 
       builder.setUpdateMasterKeyCallData('0x' + 'dd'.repeat(64));
 
+      expect((builder as any).signerKeyTypes).toEqual([6, 1]);
       // Once signerKeyTypes is set, setCallData does not throw
       expect(() => builder.setCallData('0x9999')).not.toThrow();
     });
@@ -451,15 +503,15 @@ describe('ZkapBuilder', () => {
       ).toThrow('Sender is not set');
     });
 
-    it('should set signer key types to ZkOAuthRS256', () => {
+    it('should default signer key types to [keyZkOAuthRS256, keyAddress] (zk + cosigner)', () => {
       const builder = new ZkapBuilder(mockAccountInfo);
       builder.setSender('0x' + '11'.repeat(20));
+      builder.setSignerKeyTypes([4]); // overwritten by the setter
 
-      const encodedMasterKey = '0x' + 'ee'.repeat(64);
-      const encodedTxKey = '0x' + 'ff'.repeat(64);
-      builder.setUpdateKeysCallData({ encodedMasterKey, encodedTxKey });
+      builder.setUpdateKeysCallData({ encodedMasterKey: '0x' + 'ee'.repeat(64), encodedTxKey: '0x' + 'ff'.repeat(64) });
 
-      // After setUpdateKeysCallData, setCallData should work (keyTypes set)
+      expect((builder as any).signerKeyTypes).toEqual([6, 1]);
+      // Once signerKeyTypes is set, setCallData does not throw
       expect(() => builder.setCallData('0x9999')).not.toThrow();
     });
 
@@ -470,6 +522,81 @@ describe('ZkapBuilder', () => {
       const result = builder.setUpdateKeysCallData({ encodedMasterKey: '0x' + 'aa'.repeat(64), encodedTxKey: '0x' + 'bb'.repeat(64) });
 
       expect(result).toBe(builder);
+    });
+  });
+
+  describe('master op setters: signerKeyTypes argument', () => {
+    const { keyZkOAuthRS256, keyAddress, keyWebAuthn } = PrimitiveAccountKeyTypes;
+    const keys = { encodedMasterKey: '0x' + 'ee'.repeat(64), encodedTxKey: '0x' + 'ff'.repeat(64) };
+    const setters: Array<[string, (b: ZkapBuilder, kt?: number[]) => ZkapBuilder]> = [
+      ['setUpdateKeysCallData', (b, kt) => b.setUpdateKeysCallData(keys, kt)],
+      ['setUpdateMasterKeyCallData', (b, kt) => b.setUpdateMasterKeyCallData('0x' + 'dd'.repeat(64), kt)],
+      ['setUpdateTxKeyCallData', (b, kt) => b.setUpdateTxKeyCallData('0x' + 'cc'.repeat(64), kt)],
+    ];
+
+    const newBuilder = (): ZkapBuilder => {
+      const builder = new ZkapBuilder(mockAccountInfo);
+      builder.setSender('0x' + '11'.repeat(20));
+      return builder;
+    };
+
+    describe.each(setters)('%s', (_name, apply) => {
+      it('defaults to a copy of MASTER_OP_SIGNER_KEY_TYPES', () => {
+        const builder = newBuilder();
+
+        apply(builder);
+
+        const set = (builder as any).signerKeyTypes as number[];
+        expect(set).toEqual([keyZkOAuthRS256, keyAddress]);
+        expect(set).toEqual([...MASTER_OP_SIGNER_KEY_TYPES]);
+        expect(set).not.toBe(MASTER_OP_SIGNER_KEY_TYPES);
+        expect(Object.isFrozen(set)).toBe(false);
+      });
+
+      it.each([
+        [[keyZkOAuthRS256, keyAddress]],
+        [[keyZkOAuthRS256, keyWebAuthn]],
+        [[keyZkOAuthRS256]],
+      ])('accepts explicit %j', (keyTypes) => {
+        const builder = newBuilder();
+
+        apply(builder, keyTypes);
+
+        expect((builder as any).signerKeyTypes).toEqual(keyTypes);
+      });
+
+      it('rejects an empty array (INPUT_OUT_OF_RANGE) and leaves callData and key types unchanged', () => {
+        const builder = newBuilder();
+        builder.setSignerKeyTypes([keyWebAuthn]);
+        const before = builder.getUserOp().callData;
+
+        let caught: unknown;
+        try {
+          apply(builder, []);
+        } catch (e) {
+          caught = e;
+        }
+
+        expect(caught).toBeInstanceOf(AaOperationError);
+        expect((caught as AaOperationError).code).toBe(AaOperationErrorCode.INPUT_OUT_OF_RANGE);
+        expect(builder.getUserOp().callData).toBe(before);
+        expect((builder as any).signerKeyTypes).toEqual([keyWebAuthn]);
+      });
+
+      it('rejects an unknown key type (INPUT_UNSUPPORTED)', () => {
+        const builder = newBuilder();
+
+        let caught: unknown;
+        try {
+          apply(builder, [keyZkOAuthRS256, 99]);
+        } catch (e) {
+          caught = e;
+        }
+
+        expect(caught).toBeInstanceOf(AaOperationError);
+        expect((caught as AaOperationError).code).toBe(AaOperationErrorCode.INPUT_UNSUPPORTED);
+        expect((caught as AaOperationError).message).toContain('Invalid keyType: 99');
+      });
     });
   });
 
@@ -1112,9 +1239,9 @@ describe('ZkapBuilder', () => {
       // Execute
       await builder.autoFillUserOp();
 
-      // Verify: callGasLimit should be exactly 1,325,000 (1.3M measured budget + 25k buffer)
+      // Verify: callGasLimit should be exactly 1,825,000 (UPDATE_KEYS_CALL_GAS 1.8M + 25k buffer)
       const userOp = builder.getUserOp();
-      expect(userOp.callGasLimit).toBe("0x1437c8");  // hex for 1,325,000
+      expect(userOp.callGasLimit).toBe("0x1bd8e8");  // hex for 1,825,000
     });
 
     it('should return fixed gas estimate for updateMasterKey when wallet not deployed', async () => {
