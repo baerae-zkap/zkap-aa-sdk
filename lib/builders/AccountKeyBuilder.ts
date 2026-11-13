@@ -17,6 +17,7 @@ import {
   ZkOAuthRS256KeyInfo,
 } from "../types/AccountKey";
 import crypto from "../utils/crypto";
+import { encodeWebAuthnKeyInitData } from "../utils/webauthnKey";
 import { AaOperationError, AaOperationErrorCode } from "../errors";
 /* Copied from @simplewebauthn/server/src/helpers/iso/isoCBOR.ts */
 import * as tinyCbor from "@levischuck/tiny-cbor";
@@ -339,30 +340,14 @@ export class AccountKeyBuilder {
         message: `Invalid COSE public key: y coordinate must be 32 bytes, got ${y?.length}`,
       });
     }
-    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-
-    // Key struct: { bytes32 x, bytes32 y, string credentialId }
-    const encodedKey = abiCoder.encode(
-      ["tuple(bytes32,bytes32,string)"],
-      [
-        [
-          ethers.hexlify(x),
-          ethers.hexlify(y),
-          credentialId,
-        ],
-      ]
-    );
-
-    // register(KeyPurpose, bytes) initData: abi.encode(bytes encoded, bytes32 rpIdHash, bytes origin, bool requireUV)
-    return abiCoder.encode(
-      ["bytes", "bytes32", "bytes", "bool"],
-      [
-        encodedKey,
-        ethers.hexlify(ethers.getBytes(rpIdHash)),
-        ethers.hexlify(ethers.toUtf8Bytes(origin)),
-        requireUV,
-      ]
-    );
+    return encodeWebAuthnKeyInitData({
+      x: ethers.hexlify(x),
+      y: ethers.hexlify(y),
+      credentialId,
+      rpIdHash,
+      origin,
+      requireUV,
+    });
   }
 
   getEncodedOAuthKey(

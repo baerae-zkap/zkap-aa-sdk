@@ -32,7 +32,65 @@ export * from "./utils/crypto";
 export * from "./utils/signature";
 export * from "./utils/base64url";
 export { IUserOpSigner } from "./utils/IUserOpSigner";
-export { packUserOperation, unpackUserOperation, toPimlicoFormat, createDummyPasskeySignature, createDummyZkSignature } from "./utils/userOpUtils";
+export {
+  packUserOperation,
+  unpackUserOperation,
+  toPimlicoFormat,
+  createDummyPasskeySignature,
+  createDummyZkSignature,
+  createDummyCosignSignature,
+  createDummyMasterOpSignature,
+} from "./utils/userOpUtils";
+
+// Cosigned master key: fixed layouts, builders and strict parsers
+export {
+  MASTER_KEY_INDEX,
+  INITIAL_MASTER_KEY,
+  OPERATIONAL_MASTER_KEY,
+  PASSKEY_TX_KEY,
+  MASTER_OP_KEY_INDEX_LIST,
+  MASTER_OP_SIGNER_KEY_TYPES,
+  MASTER_OP_SIGNATURE_LENGTH,
+} from "./master/constants";
+export type { MasterKeyShape, TxKeyShape } from "./master/constants";
+export {
+  buildInitialMasterKey,
+  buildOperationalMasterKey,
+  buildPasskeyTxKey,
+  encodePasskeyKeyInitData,
+} from "./master/encoding";
+export type {
+  UintInput,
+  ZkKeyInput,
+  PasskeyKeyInput,
+  InitialMasterKeyContracts,
+  OperationalMasterKeyContracts,
+  InitialMasterKeyParams,
+  OperationalMasterKeyParams,
+  PasskeyTxKeyParams,
+} from "./master/encoding";
+export {
+  decodeKeySet,
+  parseInitialMasterKey,
+  parseOperationalMasterKey,
+  parsePasskeyTxKey,
+} from "./master/parsing";
+export type {
+  DecodedKeySet,
+  ParsedZkKey,
+  ParsedCosignerKey,
+  ParsedPasskeyKey,
+  ParsedInitialMasterKey,
+  ParsedOperationalMasterKey,
+  ParsedPasskeyTxKey,
+} from "./master/parsing";
+export { classifyMasterKey, reconstructOperationalMasterKey } from "./master/onchain";
+export type {
+  MasterKeyExpectation,
+  MasterKeyKind,
+  MasterKeyClassification,
+  ReconstructOperationalMasterKeyParams,
+} from "./master/onchain";
 export { computeSalt } from "./utils/salt";
 export {
   calcAltoRequiredPvg,
@@ -61,7 +119,18 @@ export type { PimlicoUserOperation, PimlicoGasEstimate } from "./types/UserOpera
 // Account reader
 export { AccountReader } from "./reader/AccountReader";
 export type { AccountReaderConfig, AccountReaderOptions } from "./reader/AccountReader";
-export type { TxKeySlots, ReadVia, TxKeyInfo, MasterKeyInfo, WebAuthnKeyData as AccountWebAuthnKeyData, KeyType } from "./reader/types";
+export type {
+  TxKeySlots,
+  ReadVia,
+  TxKeyInfo,
+  MasterKeyInfo,
+  OnchainKeyEntry,
+  OnchainKeySet,
+  OnchainKeyState,
+  OnchainZkKeyData,
+  WebAuthnKeyData as AccountWebAuthnKeyData,
+  KeyType,
+} from "./reader/types";
 export { buildPasskeysResult, normalizeOptions as normalizePasskeyOptions } from "./reader/passkeys";
 export type {
   GetPasskeysOptions,

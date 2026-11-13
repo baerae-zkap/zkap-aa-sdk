@@ -7,6 +7,200 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-13
+
+Adds builders, parsers and an on-chain reader for the cosigned master key, and
+makes master key operations default to a cosigned signature.
+
+**Why:** a ZKAP wallet's master key is no longer a zk key on its own. It now
+pairs the zk key with the service's cosigner key (an address key), so every
+master key operation carries two signatures:
+
+| | Keys (index: key, weight) | Threshold |
+|---|---|---|
+| Initial master key (installed at deployment, part of the address) | `[0]` zk 1-of-1, 1 · `[1]` cosigner address key, 1 | 2 |
+| Operational master key | `[0]` zk 3-of-6, 2 · `[1]` cosigner address key, 1 · `[2]` passkey (`requireUV = false`), 1 | 3 |
+
+Until now a consumer had to assemble these blobs with `AccountKeyBuilder` and
+read them back with `getMasterKeyInfo`, which could not do the job: it called
+verifier getters with the wrong signature and always came back with an empty
+anchor. A wrong master key blob in `updateKeys` installs a key no proof can
+satisfy and locks the wallet's master key, so the layouts, their strict
+parsers, the on-chain classification and the gas profile of a cosigned op now
+live in the SDK, checked against known-answer vectors that the account
+contracts accepted on a local test chain.
+
+> **Released as a minor.** The changes under *Breaking* alter defaults and
+> return types that existing code relies on, which on 0.x calls for a minor
+> bump. `^0.2.0` ranges do not pick this release up; move to `^0.3.0` after
+> going through the migration notes below.
+
+### Breaking
+
+- **`setUpdateKeysCallData` / `setUpdateMasterKeyCallData` /
+  `setUpdateTxKeyCallData` default to cosigned signer key types.** They used to
+  force `signerKeyTypes = [keyZkOAuthRS256]`. They now take an optional second
+  argument, `signerKeyTypes`, validated like `setSignerKeyTypes()`, and default
+  to `[keyZkOAuthRS256, keyAddress]` (`MASTER_OP_SIGNER_KEY_TYPES`). The
+  `verificationGasLimit` that `autoFillUserOp()` computes changes with it: the
+  default adds the address key's budget (`ADDRESS_KEY_VALIDATION_GAS`).
+  - **Migration**: for a wallet whose master key is still a zk key alone, pass
+    `[PrimitiveAccountKeyTypes.keyZkOAuthRS256]` explicitly. When the passkey
+    cosigns instead of the cosigner, pass
+    `[keyZkOAuthRS256, keyWebAuthn]`. Keep `keyZkOAuthRS256` first.
+- **`AccountReader.getMasterKeyInfo` returns a different shape.** `keyCount`,
+  `is3of3`, `anchor` and `verifierAddress` are gone. `MasterKeyInfo` is now
+  `{ account, deployed, threshold, keys, truncated, readVia }`, where `keys` is
+  every master key as an `OnchainKeyEntry` (logic contract, key id, weight,
+  key type, and the zk / signer / WebAuthn data its logic contract holds). It
+  reads the whole list instead of `masterKeyList(0)` only, and an undeployed
+  account resolves with `deployed: false`, `threshold: 0`, `keys: []` instead
+  of throwing `AaFetchError`. It is now `readKeyState().master`: it reads the
+  tx key list as well, so the request is larger (two `eth_call`s through
+  Multicall3 whatever the key count; without Multicall3, one call per getter)
+  and a failed read on the tx side fails it too.
+  - **Migration**: read the zk key from `keys.find((k) => k.keyType === 'zkOAuth')?.zk`
+    (`anchorWithHash` is the `getAnchor()` return — the anchor followed by one
+    on-chain hash). Check `deployed` where you used to catch the throw. To ask
+    "which layout is this wallet on", use `classifyMasterKey` instead.
+- **A key list ends only on a revert without data or `Panic(0x32)`.**
+  `readTxKeySlots`, `getTxKeyList`, `getPasskeys` and `findTxKeysByRpId` end
+  the list at the first `txKeyList(i)` that reverts without data — what the
+  account's compiler-generated array getter answers past the end of the list —
+  or with `Panic(0x32)`, or at a zero-address slot. `readKeyState` and
+  everything built on it end the master and tx lists the same way, except that
+  a zero-address slot throws there. Any other failure — other revert data
+  (`Error(string)`, another `Panic`), empty data, a failure that carries no
+  revert data (a node error such as a rate limit on the per-call path) — now
+  throws `AaFetchError`. Before, any failed slot silently ended the list.
+  - **Migration**: none on a chain with Multicall3. On a chain without it
+    the reader calls each getter on its own and relies on the node answering
+    a data-less revert with `data: "0x"` (checked against a local anvil
+    node); a node that omits `data` for such a revert makes every key list
+    read throw — it never reads as a short list. There, and for a custom
+    `call`, pass an
+    `isRevertError` that returns `true` only for a contract revert and passes
+    the revert data through as the error's `data` — `"0x"` for a revert
+    without data. If it drops the data, every list end reads as a failure; if
+    it reports a node error as a revert with `data: "0x"`, the node error reads
+    as the end of a list. Reverts are routine there: `readKeyState` asks each
+    key's logic contract for the getters of every key type, and the ones that
+    do not match the key's type always revert.
+- **`readTxKeySlots` throws on a node error in its second round.** On the
+  per-call path, a `keyType()` or `getKeyData` call that failed without revert
+  data (a node error) used to come back as an `"unknown"` key or a WebAuthn
+  key without data; it now throws `AaFetchError`. A real revert there still
+  gives `"unknown"` / no data, as before.
+- **`ZkapBuilder.setSignature` validates its arguments.** It throws
+  `AaOperationError` — `INPUT_OUT_OF_RANGE` when `keyIndexList` and
+  `keySignatureList` differ in length, `INPUT_INVALID` when `keyIndexList`
+  contains a duplicate index. It used to encode whatever it was given.
+- **`updateKeys` callGasLimit.** With initCode (wallet not yet deployed) it is
+  `ZkapBuilder.UPDATE_KEYS_CALL_GAS + GAS_BUFFER` = 1,825,000 (was 1,325,000):
+  installing the operational master key needed at least 1,202,822 on a local
+  test chain. On a deployed wallet `updateKeys` gets `estimate × 1.2 + 25,000`
+  (was `estimate + 25,000`); every other call keeps `estimate + 25,000`.
+
+### Migration
+
+- **Master key blobs**: replace hand-assembled `AccountKeyBuilder` master keys
+  with `buildInitialMasterKey` (deployment) and `buildOperationalMasterKey`
+  (onboarding, passkey replacement). The initial master key determines the
+  wallet address, so derive the address from the builder's output.
+- **Dummy signature for a master op**: replace
+  `setSignature([0], [createDummyZkSignature(n)])` with the cosigned dummy —
+  `setSignature([...MASTER_OP_KEY_INDEX_LIST], [createDummyZkSignature(n), createDummyCosignSignature()])`,
+  whose bytes equal `createDummyMasterOpSignature(n)`. `n` is 1 for the
+  initial master key and 3 for the operational one.
+- **Passkey tx key**: build it with `buildPasskeyTxKey`. `TxKeyHelper` encodes
+  a new key with `requireUV = true` by default and always re-encodes existing
+  keys with `requireUV = true`, so its bytes differ from the passkey entry of
+  the operational master key (`requireUV = false`).
+
+### Added
+
+- **Builders** — `buildInitialMasterKey({ contracts, zk, cosigner })`,
+  `buildOperationalMasterKey({ contracts, zk, cosigner, passkey })`,
+  `buildPasskeyTxKey({ contracts, passkey })` and
+  `encodePasskeyKeyInitData(passkey)`. They validate every input (non-zero
+  well-formed addresses, numbers below the BN254 scalar field,
+  `hAudList ≠ 0`, the anchor length of the layout) and throw
+  `AaOperationError` rather than encode a key that cannot sign. Numbers are
+  `bigint`, `0x` hex or decimal strings; JS numbers are rejected. A passkey is
+  given as a COSE public key or as `x` / `y`, and with `rpId`, `rpIdHash` or
+  both (then `rpIdHash` must equal `sha256(rpId)`); both key forms encode to
+  the same bytes. An `rpId` containing `/` or `:` (an origin) is rejected, and
+  `requireUV` may be passed only as `false` — so the passkey records of the
+  known-answer vectors can be passed in unchanged. The SDK does not compute `hAudList` or
+  the anchor. Types: `UintInput`, `ZkKeyInput`, `PasskeyKeyInput`,
+  `InitialMasterKeyContracts`, `OperationalMasterKeyContracts`,
+  `InitialMasterKeyParams`, `OperationalMasterKeyParams`, `PasskeyTxKeyParams`.
+- **Strict parsers** — `decodeKeySet` (no shape check), `parseInitialMasterKey`,
+  `parseOperationalMasterKey`, `parsePasskeyTxKey`. Each rejects a layout
+  mismatch and any input the builder would not reproduce byte for byte. Types:
+  `DecodedKeySet`, `ParsedZkKey`, `ParsedCosignerKey`, `ParsedPasskeyKey`,
+  `ParsedInitialMasterKey`, `ParsedOperationalMasterKey`, `ParsedPasskeyTxKey`.
+- **Layout constants** — `MASTER_KEY_INDEX` (`{ zk: 0, cosigner: 1, passkey: 2 }`),
+  `INITIAL_MASTER_KEY`, `OPERATIONAL_MASTER_KEY`, `PASSKEY_TX_KEY`,
+  `MASTER_OP_KEY_INDEX_LIST` (`[0, 1]`), `MASTER_OP_SIGNER_KEY_TYPES`
+  (`[keyZkOAuthRS256, keyAddress]`), `MASTER_OP_SIGNATURE_LENGTH`
+  (`{ singleProof: 1120, threeProofs: 1760 }`); types `MasterKeyShape`,
+  `TxKeyShape`.
+- **`AccountReader.readKeyState(address)`** — both key lists with thresholds,
+  weights, key types and each key's logic-contract data. Through Multicall3 it
+  takes two `eth_call`s; the second repeats the first one's reads and must
+  match them byte for byte, so the details belong to the state the lists were
+  read from. Without Multicall3 the first round is read again at the end. A
+  value the read needs but did not get throws `AaFetchError`; it is never
+  reported as absent. Types: `OnchainKeyState`, `OnchainKeySet`,
+  `OnchainKeyEntry`, `OnchainZkKeyData`. Key ids and zk values are `bigint`,
+  so `JSON.stringify` throws on an `OnchainKeyState` (and on `MasterKeyInfo`)
+  — pass a replacer that converts `bigint`, e.g. to a decimal string.
+- **`Result3.revertDataMissing`** — set on a per-call result whose error was
+  classified as a revert but carried no revert data (`err.data` not a string);
+  `returnData` is `"0x"` as before. The reader never reads such a result as a
+  value or as the end of a key list. `BatchCallerOptions.isRevertError` now
+  documents what a classifier must keep apart.
+- **`classifyMasterKey(state, expected)`** and
+  **`AccountReader.classifyMasterKey(address, expected)`** — `"undeployed"`,
+  `"initial"`, `"operational"` or `"other"` (with `reasons`), given the
+  expected contract addresses and cosigner. Types: `MasterKeyExpectation`,
+  `MasterKeyKind`, `MasterKeyClassification`.
+- **`reconstructOperationalMasterKey(state, params)`** and
+  **`AccountReader.reconstructOperationalMasterKey(address, params)`** —
+  rebuild a wallet's operational master key with a new passkey, taking
+  `hAudList` and the anchor from chain. Refuses (`AaOperationError`,
+  `INPUT_INVALID`) unless the state classifies as `"operational"`. Type:
+  `ReconstructOperationalMasterKeyParams`.
+- **Dummy signatures** — `createDummyCosignSignature()` (65 bytes) and
+  `createDummyMasterOpSignature(proofCount: 1 | 3)` (the full cosigned
+  signature, 1120 / 1760 bytes).
+- **`ZkapBuilder.UPDATE_KEYS_CALL_GAS`** (`1_800_000n`).
+- **Known-answer vectors** — `fixtures/master-key-cosign-vectors.json`, shipped
+  in the package and exported as
+  `@baerae/zkap-aa/fixtures/master-key-cosign-vectors.json`: inputs, the
+  encoded keys, the on-chain `getAnchor()` value and the signature lengths,
+  produced by an encoder independent of this package.
+
+### Changed
+
+- `createDummyZkSignature(n)` is documented as the zk entry only; master key
+  operations need the cosigned signature.
+- The WebAuthn key encoding of `AccountKeyBuilder` and of the new builders goes
+  through one encoder; `AccountKeyBuilder` output is byte-for-byte unchanged.
+- The reader and `lib/master` read contracts only through the generated ABIs;
+  an ESLint rule rejects hand-written ABI fragments there.
+
+### Fixed
+
+- **`getMasterKeyInfo` always returned an empty anchor.** It called
+  `getData(uint256)` and `getAnchor(uint256)` on the verifier, while the
+  contract's getters take `(purpose, account, keyId)`. Both calls reverted, the
+  errors were swallowed, and the result reported `anchor: []`. The reader now
+  uses the generated contract ABIs.
+- The txKey reads no longer turn a failed slot read into the end of the list
+  (see *Breaking*).
+
 ## [0.2.2] - 2026-09-09
 
 Adds `AccountReader.getPasskeys` and re-implements txKey reads over Multicall3.

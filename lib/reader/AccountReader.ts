@@ -1,15 +1,46 @@
 import { ethers } from "ethers";
-import { AccountKeyWebAuthnABI, ZkapAccountABI } from "../types/abi";
+import {
+  AccountKeyAddressABI,
+  AccountKeyWebAuthnABI,
+  AccountKeyZkOAuthRS256VerifierABI,
+  ZkapAccountABI,
+} from "../types/abi";
 import { AaFetchError, AaFetchErrorCode, AaOperationError, AaOperationErrorCode } from "../errors";
-import { BatchCaller, ethCallFromProvider, hasValue } from "./transport";
+import { BatchCaller, ethCallFromProvider, hasValue, isListEnd } from "./transport";
 import type { Call3, EthCall, Result3 } from "./transport";
 import { buildPasskeysResult, normalizeOptions } from "./passkeys";
 import type { GetPasskeysOptions, PasskeysResult } from "./passkeys";
 import { keyTypeFromPrimitive } from "./types";
-import type { KeyType, MasterKeyInfo, TxKeyInfo, TxKeySlots, WebAuthnKeyData } from "./types";
+import { classifyMasterKey, reconstructOperationalMasterKey } from "../master/onchain";
+import type {
+  MasterKeyClassification,
+  MasterKeyExpectation,
+  ReconstructOperationalMasterKeyParams,
+} from "../master/onchain";
+import type {
+  KeyType,
+  MasterKeyInfo,
+  OnchainKeyEntry,
+  OnchainKeySet,
+  OnchainKeyState,
+  TxKeyInfo,
+  TxKeySlots,
+  WebAuthnKeyData,
+} from "./types";
 
 // Re-exported so existing `import … from "./reader/AccountReader"` paths keep resolving.
-export type { KeyType, WebAuthnKeyData, TxKeyInfo, MasterKeyInfo, TxKeySlots, ReadVia } from "./types";
+export type {
+  KeyType,
+  WebAuthnKeyData,
+  TxKeyInfo,
+  MasterKeyInfo,
+  TxKeySlots,
+  ReadVia,
+  OnchainKeyEntry,
+  OnchainKeySet,
+  OnchainKeyState,
+  OnchainZkKeyData,
+} from "./types";
 
 /** Tuning knobs shared by every transport mode. */
 export interface AccountReaderOptions {
@@ -18,7 +49,8 @@ export interface AccountReaderOptions {
   /**
    * How many txKey slots to read (default 5, the WebAuthn singleton's per-account
    * cap). The account contract has its own limit; this exists for forward
-   * compatibility only. Integer ≥ 1.
+   * compatibility only. Integer ≥ 1. Also the tx-key window of
+   * {@link AccountReader.readKeyState}; master keys always use a window of 5.
    */
   maxTxKeys?: number;
   /** See {@link BatchCallerOptions.isRevertError}. Only matters on chains without Multicall3. */
@@ -40,28 +72,55 @@ export type AccountReaderConfig = AccountReaderOptions &
   );
 
 const DEFAULT_MAX_TX_KEYS = 5;
+/** How many master keys {@link AccountReader.readKeyState} reads before reporting `truncated`. */
+const MASTER_KEY_WINDOW = 5;
+/** `IAccountKey.KeyPurpose.Master` */
+const KEY_PURPOSE_MASTER = 0;
 /** `IAccountKey.KeyPurpose.Tx` */
 const KEY_PURPOSE_TX = 1;
 const READ_TX_KEYS = "read_tx_keys";
+const READ_KEY_STATE = "read_key_state";
 
+// Every ABI comes from the generated module (synced contract artifacts); never
+// hand-write fragments here — a drifted fragment silently reads nothing.
 const accountIface = new ethers.Interface(ZkapAccountABI);
 // `keyType()` is common to every key logic contract; the WebAuthn ABI carries it too.
 const webAuthnIface = new ethers.Interface(AccountKeyWebAuthnABI);
+const zkIface = new ethers.Interface(AccountKeyZkOAuthRS256VerifierABI);
+const addressKeyIface = new ethers.Interface(AccountKeyAddressABI);
 
-// Minimal ABI fragments for getMasterKeyInfo
-const ZKAP_ACCOUNT_ABI = [
-  "function txKeyList(uint256 index) view returns (address logic, uint256 keyId)",
-  "function txKeyThreshold() view returns (uint8)",
-  "function masterKeyThreshold() view returns (uint8)",
-  "function txKeyWeightList(uint256 index) view returns (uint8)",
-  "function masterKeyList(uint256 index) view returns (address logic, uint256 keyId)",
-];
+const KEY_LISTS = {
+  master: {
+    list: "masterKeyList",
+    weight: "masterKeyWeightList",
+    threshold: "masterKeyThreshold",
+    purpose: KEY_PURPOSE_MASTER,
+  },
+  tx: { list: "txKeyList", weight: "txKeyWeightList", threshold: "txKeyThreshold", purpose: KEY_PURPOSE_TX },
+} as const;
 
-// ZkOAuth verifier ABI
-const ZK_OAUTH_VERIFIER_ABI = [
-  "function getAnchor(uint256 keyId) view returns (uint256[] anchor)",
-  "function getData(uint256 keyId) view returns (uint256 n, uint256 k, uint256 hAudList, uint256[] anchor)",
-];
+/** Byte-for-byte equality of two rounds of answers. */
+function sameResults(a: Result3[], b: Result3[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (r, i) =>
+        r.success === b[i].success &&
+        r.returnData.toLowerCase() === b[i].returnData.toLowerCase() &&
+        !r.revertDataMissing === !b[i].revertDataMissing,
+    )
+  );
+}
+
+/** A key-list entry from round 1 of {@link AccountReader.readKeyState}. */
+interface KeySlot {
+  set: "master" | "tx";
+  purpose: number;
+  index: number;
+  logic: string;
+  keyId: bigint;
+  weight: number;
+}
 
 /**
  * Read-only utility for inspecting on-chain state of a deployed ZkapAccount.
@@ -85,7 +144,6 @@ export class AccountReader {
   private readonly rpcUrl?: string;
   private readonly ethCall: EthCall;
   private readonly batch: BatchCaller;
-  private readonly runner: ethers.ContractRunner;
   private readonly maxTxKeys: number;
 
   constructor(config: AccountReaderConfig) {
@@ -143,11 +201,6 @@ export class AccountReader {
       isRevertError: c.isRevertError,
       url: this.rpcUrl,
     });
-    // Lets ethers.Contract run view calls over the injected transport without a Provider.
-    this.runner = {
-      provider: null,
-      call: (tx) => this.ethCall({ to: tx.to as string, data: tx.data as string }),
-    };
   }
 
   /**
@@ -183,9 +236,24 @@ export class AccountReader {
    * contract for `keyType()` and `getKeyData(Tx, account, keyId)`. An
    * undeployed account is detected from round 1 alone.
    *
+   * The list ends at the first `txKeyList(i)` that reverts without data —
+   * what the account's public array getter answers past the end of the array
+   * — or with `Panic(0x32)` (see {@link isListEnd}). Unlike
+   * {@link readKeyState}, it also ends at a slot holding the zero address,
+   * without reading further. A slot that fails any other way — other revert
+   * data, empty data, a node error on the per-call path (a failure without
+   * revert data) — is not taken as the end of the list: the read throws.
+   *
+   * A slot whose `keyType()` reverts or does not decode comes back as
+   * `"unknown"`, and a WebAuthn slot whose `getKeyData` does so comes back
+   * without `webauthn`; on the per-call path a node error there throws
+   * instead.
+   *
    * @throws `AaOperationError` (`INPUT_INVALID_ADDRESS`) for a malformed address.
    * @throws `AaFetchError` (`TRANSPORT`) when the node cannot be reached, or
-   *   (`RESPONSE_SHAPE`) when it answers with undecodable data.
+   *   (`RESPONSE_SHAPE`) when it answers with undecodable data, a slot fails
+   *   in a way that does not end the list, or a needed answer came back
+   *   without revert data.
    */
   async readTxKeySlots(address: string): Promise<TxKeySlots> {
     if (!ethers.isAddress(address)) {
@@ -213,13 +281,15 @@ export class AccountReader {
     const slots: { index: number; logic: string; keyId: bigint }[] = [];
     for (let index = 0; index < this.maxTxKeys; index++) {
       const result = round1.results[index];
-      // Out-of-range slots revert; the list is filled from the front.
-      if (!hasValue(result)) break;
+      // The list is filled from the front and ends where the getter reverts (see isListEnd).
+      if (this.listEnded(result, `txKeyList(${index})`, READ_TX_KEYS)) break;
       const [logic, keyId] = this.decodeSlot(result.returnData);
       if (!logic || logic === ethers.ZeroAddress) break;
       slots.push({ index, logic, keyId });
     }
-    const truncated = slots.length === this.maxTxKeys && hasValue(round1.results[this.maxTxKeys]);
+    const truncated =
+      slots.length === this.maxTxKeys &&
+      !this.listEnded(round1.results[this.maxTxKeys], `txKeyList(${this.maxTxKeys})`, READ_TX_KEYS);
 
     if (slots.length === 0) {
       return { deployed: true, keys: [], truncated, readVia: round1.via };
@@ -236,7 +306,9 @@ export class AccountReader {
     const round2 = await this.batch.batch(detailCalls, READ_TX_KEYS);
 
     const keys = slots.map((slot, position): TxKeyInfo => {
-      const keyType = this.decodeKeyType(round2.results[position * 2]);
+      const keyTypeResult = round2.results[position * 2];
+      this.requireRevertData(keyTypeResult, `keyType() for tx key ${slot.index}`, READ_TX_KEYS);
+      const keyType = this.decodeKeyType(keyTypeResult);
       const info: TxKeyInfo = {
         index: slot.index,
         logicContract: slot.logic,
@@ -244,7 +316,9 @@ export class AccountReader {
         keyType,
       };
       if (keyType === "webauthn") {
-        const webauthn = this.decodeKeyData(round2.results[position * 2 + 1]);
+        const keyDataResult = round2.results[position * 2 + 1];
+        this.requireRevertData(keyDataResult, `getKeyData for tx key ${slot.index}`, READ_TX_KEYS);
+        const webauthn = this.decodeKeyData(keyDataResult);
         if (webauthn) info.webauthn = webauthn;
       }
       return info;
@@ -295,84 +369,312 @@ export class AccountReader {
   }
 
   /**
-   * Read the master key configuration from a deployed ZkapAccount.
+   * Read both key lists of a ZkapAccount — thresholds, every key's weight,
+   * type and logic-contract data — from one consistent state.
    *
-   * Queries `masterKeyList(0)` to obtain the verifier address and key ID, then
-   * attempts to read anchor data via `getData` or `getAnchor` to determine whether
-   * the account uses a 3-of-3 threshold scheme.
+   * Two round trips: round 1 asks the account for both thresholds and
+   * `masterKeyList` / `masterKeyWeightList` / `txKeyList` / `txKeyWeightList`
+   * over the read window plus one probe slot; round 2 asks each key's logic
+   * contract for `keyType()` and all three typed getters (`getData` +
+   * `getAnchor`, `getSigner`, `getKeyData`), of which only the one matching
+   * `keyType()` is used. A list ends at the first index whose getter reverts
+   * without data — what the account's public array getters answer past the
+   * end of the array — or with `Panic(0x32)` (see {@link isListEnd}), and its
+   * weight list must end at the same index. A slot holding the zero address is
+   * not an end: its `keyType()` cannot be read, so the read throws (where
+   * {@link readTxKeySlots} ends its list there). Any other failure of a call
+   * the read needs — other revert data, empty data, a node error on the
+   * per-call path (a failure without revert data), a `keyType()` that does not
+   * answer — throws; it is never taken as the end of a list or as an
+   * `"unknown"` key.
    *
-   * @param address - Address of the deployed ZkapAccount.
-   * @returns A {@link MasterKeyInfo} describing the threshold, key count, anchor values,
-   *   and verifier contract address.
-   * @throws `AaFetchError` if `masterKeyList(0)` cannot be read.
+   * Consistency: through Multicall3, round 2 repeats round 1's calls inside the
+   * same `aggregate3`, and their answers must equal round 1's byte for byte —
+   * so the details were read from the state round 1 describes, whatever the
+   * chain's block numbering. Without Multicall3, round 1 is read again after
+   * round 2 and must come back identical. One mismatch triggers one full
+   * re-read; a second mismatch throws.
+   *
+   * Windows: master keys {@link MASTER_KEY_WINDOW} (5), tx keys `maxTxKeys`.
+   * A list longer than its window is returned cut short with `truncated: true`.
+   *
+   * @throws `AaOperationError` (`INPUT_INVALID_ADDRESS`) for a malformed address.
+   * @throws `AaFetchError` (`TRANSPORT`) when the node cannot be reached;
+   *   (`RESPONSE_SHAPE`) when an answer cannot be decoded, when a list getter
+   *   fails in a way that does not end a list, when `keyType()` or the getter matching a
+   *   key's type fails, or when the state keeps changing between rounds. Data
+   *   that could not be read is never reported as absent.
    */
-  async getMasterKeyInfo(address: string): Promise<MasterKeyInfo> {
-    const account = new ethers.Contract(address, ZKAP_ACCOUNT_ABI, this.runner);
-
-    let logic: string;
-    let keyId: bigint;
-    try {
-      const entry = await account.masterKeyList(0);
-      logic = entry[0] as string;
-      keyId = entry[1] as bigint;
-    } catch (err) {
-      throw new AaFetchError({
-        code: AaFetchErrorCode.TRANSPORT,
-        operation: "get_master_key_info",
-        service: "rpc",
-        url: this.rpcUrl,
-        method: "POST",
-        cause: err,
-        message: `AccountReader: failed to read masterKeyList(0) for ${address}`,
+  async readKeyState(address: string): Promise<OnchainKeyState> {
+    if (!ethers.isAddress(address)) {
+      throw new AaOperationError({
+        code: AaOperationErrorCode.INPUT_INVALID_ADDRESS,
+        operation: READ_KEY_STATE,
+        message: `AccountReader: invalid account address "${address}"`,
       });
     }
+    const first = await this.readKeyStateOnce(address);
+    if ("state" in first) return first.state;
+    const second = await this.readKeyStateOnce(address);
+    if ("state" in second) return second.state;
+    throw new AaFetchError({
+      code: AaFetchErrorCode.RESPONSE_SHAPE,
+      operation: READ_KEY_STATE,
+      service: "rpc",
+      url: this.rpcUrl,
+      method: "POST",
+      message: `AccountReader: key state of ${address} changed between reads twice in a row (${second.mismatch})`,
+    });
+  }
 
-    let threshold = 1;
-    try {
-      const t = await account.masterKeyThreshold();
-      threshold = Number(t);
-    } catch {
-      // ignore, default 1
+  /**
+   * Read the master key list of a ZkapAccount — see {@link readKeyState}.
+   *
+   * An undeployed account resolves with `deployed: false`, `threshold: 0` and
+   * no keys; it does not throw.
+   */
+  async getMasterKeyInfo(address: string): Promise<MasterKeyInfo> {
+    const { account, deployed, master, readVia } = await this.readKeyState(address);
+    return { account, deployed, threshold: master.threshold, keys: master.keys, truncated: master.truncated, readVia };
+  }
+
+  /**
+   * Read the account's key state ({@link readKeyState}) and classify its master
+   * key ({@link classifyMasterKey}). Resolves with the state that was classified.
+   *
+   * @throws `AaFetchError` when the read fails — a failed read is never reported
+   *   as `"other"`.
+   */
+  async classifyMasterKey(
+    address: string,
+    expected: MasterKeyExpectation
+  ): Promise<MasterKeyClassification & { state: OnchainKeyState }> {
+    const state = await this.readKeyState(address);
+    return { ...classifyMasterKey(state, expected), state };
+  }
+
+  /**
+   * Read the account's key state ({@link readKeyState}) and rebuild its
+   * operational master key with `params.passkey` ({@link reconstructOperationalMasterKey}).
+   * Resolves with the encoded master key and the state it was rebuilt from.
+   *
+   * The result is only as current as this read: use it right away, and re-check
+   * the wallet's key state before submitting it. It is valid only for
+   * `address` (`state.account`): submitted to another wallet it locks that
+   * wallet's master key.
+   *
+   * @throws `AaOperationError` when the master key is not operational, or from
+   *   the builder for an invalid passkey.
+   * @throws `AaFetchError` when the read fails.
+   */
+  async reconstructOperationalMasterKey(
+    address: string,
+    params: ReconstructOperationalMasterKeyParams
+  ): Promise<{ encodedMasterKey: string; state: OnchainKeyState }> {
+    const state = await this.readKeyState(address);
+    return { encodedMasterKey: reconstructOperationalMasterKey(state, params), state };
+  }
+
+  private async readKeyStateOnce(address: string): Promise<{ state: OnchainKeyState } | { mismatch: string }> {
+    const account = ethers.getAddress(address);
+    const lists = [
+      { set: "master" as const, window: MASTER_KEY_WINDOW },
+      { set: "tx" as const, window: this.maxTxKeys },
+    ];
+    // Layout: [masterKeyThreshold, txKeyThreshold, then per list: list(0..window), weight(0..window)]
+    const round1Calls: Call3[] = [
+      this.accountCall(address, KEY_LISTS.master.threshold, []),
+      this.accountCall(address, KEY_LISTS.tx.threshold, []),
+    ];
+    for (const { set, window } of lists) {
+      for (const fn of [KEY_LISTS[set].list, KEY_LISTS[set].weight]) {
+        for (let index = 0; index <= window; index++) round1Calls.push(this.accountCall(address, fn, [index]));
+      }
+    }
+    const round1 = await this.batch.batch(round1Calls, READ_KEY_STATE);
+    const via = round1.via;
+
+    // A call to an address without code succeeds with empty data.
+    const head = round1.results[0];
+    if (head.success && head.returnData === "0x") {
+      const empty = (): OnchainKeySet => ({ threshold: 0, keys: [], truncated: false });
+      return { state: { account, deployed: false, master: empty(), tx: empty(), readVia: via } };
     }
 
-    // Count master keys and detect 3-of-3
-    let keyCount = 1;
-    const anchorList: string[] = [];
-    // Attempt to read anchor data from the verifier
-    try {
-      const verifierContract = new ethers.Contract(logic, ZK_OAUTH_VERIFIER_ABI, this.runner);
-      const data = await verifierContract.getData(keyId);
-      const anchor: bigint[] = data[3];
-      for (const a of anchor) {
-        anchorList.push(a.toString());
-      }
-      // Infer 3-of-3 from anchor count
-      if (anchor.length >= 3) {
-        keyCount = 3;
-      }
-    } catch {
-      // Verifier doesn't support getData, try getAnchor
-      try {
-        const verifierContract = new ethers.Contract(logic, ZK_OAUTH_VERIFIER_ABI, this.runner);
-        const anchor: bigint[] = await verifierContract.getAnchor(keyId);
-        for (const a of anchor) {
-          anchorList.push(a.toString());
+    let offset = 2;
+    const parsed = lists.map(({ set, window }, position) => {
+      const parsedList = this.parseKeyList(round1.results, set, position, offset, window);
+      offset += 2 * (window + 1);
+      return parsedList;
+    });
+    const slots = parsed.flatMap((p) => p.slots);
+
+    let details: Result3[] = [];
+    if (slots.length > 0) {
+      const detailCalls = slots.flatMap(({ logic, keyId, purpose }): Call3[] => {
+        const args = [purpose, address, keyId];
+        return [
+          { target: logic, allowFailure: true, callData: webAuthnIface.encodeFunctionData("keyType") },
+          { target: logic, allowFailure: true, callData: zkIface.encodeFunctionData("getData", args) },
+          { target: logic, allowFailure: true, callData: zkIface.encodeFunctionData("getAnchor", args) },
+          { target: logic, allowFailure: true, callData: addressKeyIface.encodeFunctionData("getSigner", args) },
+          { target: logic, allowFailure: true, callData: webAuthnIface.encodeFunctionData("getKeyData", args) },
+        ];
+      });
+
+      // Check consistency before decoding: after a concurrent key change the
+      // round-2 getters may revert, and that must lead to a re-read, not an error.
+      if (via === "multicall") {
+        // Round 1's calls run again in the same eth_call as the details, so an
+        // identical answer proves the details belong to the state round 1 read.
+        const round2 = await this.batch.batch([...round1Calls, ...detailCalls], READ_KEY_STATE);
+        if (round2.via !== via) return { mismatch: "Multicall3 answered round 1 but not round 2" };
+        if (!sameResults(round2.results.slice(0, round1Calls.length), round1.results)) {
+          return { mismatch: "the key lists differ between rounds" };
         }
-        if (anchor.length >= 3) {
-          keyCount = 3;
-        }
-      } catch {
-        // Not available
+        details = round2.results.slice(round1Calls.length);
+      } else {
+        details = (await this.batch.batch(detailCalls, READ_KEY_STATE)).results;
+        const again = await this.batch.batch(round1Calls, READ_KEY_STATE);
+        if (!sameResults(again.results, round1.results)) return { mismatch: "the key lists differ on re-read" };
       }
     }
 
-    return {
-      threshold,
-      keyCount,
-      is3of3: keyCount >= 3,
-      anchor: anchorList,
-      verifierAddress: logic,
+    const keys = slots.map((slot, position) => this.decodeKeyEntry(slot, details, position * 5));
+    const sets = parsed.map(
+      (p): OnchainKeySet => ({
+        threshold: p.threshold,
+        keys: keys.filter((_, i) => slots[i].set === p.set),
+        truncated: p.truncated,
+      }),
+    );
+    return { state: { account, deployed: true, master: sets[0], tx: sets[1], readVia: via } };
+  }
+
+  private accountCall(address: string, fn: string, args: unknown[]): Call3 {
+    return { target: address, allowFailure: true, callData: accountIface.encodeFunctionData(fn, args) };
+  }
+
+  /** Decode one key list from round 1. `thresholdAt` is the threshold's position in `results`. */
+  private parseKeyList(
+    results: Result3[],
+    set: "master" | "tx",
+    thresholdAt: number,
+    offset: number,
+    window: number,
+  ): { set: "master" | "tx"; threshold: number; slots: KeySlot[]; truncated: boolean } {
+    const fns = KEY_LISTS[set];
+    const listAt = (index: number) => results[offset + index];
+    const weightAt = (index: number) => results[offset + window + 1 + index];
+
+    const [threshold] = this.decodeRequired(accountIface, fns.threshold, results[thresholdAt], fns.threshold);
+    const slots: KeySlot[] = [];
+    // Index `window` is only probed: a value there means the list continues past the window.
+    for (let index = 0; index <= window; index++) {
+      if (this.listEnded(listAt(index), `${fns.list}(${index})`, READ_KEY_STATE)) {
+        if (!isListEnd(weightAt(index))) {
+          throw this.shapeError(
+            READ_KEY_STATE,
+            weightAt(index).returnData,
+            `AccountReader: ${fns.list} ends at ${index} but ${fns.weight}(${index}) does not end there`,
+          );
+        }
+        return { set, threshold: Number(threshold), slots, truncated: false };
+      }
+      if (index === window) break;
+      const [logic, keyId] = this.decodeRequired(accountIface, fns.list, listAt(index), `${fns.list}(${index})`);
+      const [weight] = this.decodeRequired(accountIface, fns.weight, weightAt(index), `${fns.weight}(${index})`);
+      slots.push({ set, purpose: fns.purpose, index, logic, keyId, weight: Number(weight) });
+    }
+    return { set, threshold: Number(threshold), slots, truncated: true };
+  }
+
+  /**
+   * Whether a key-list getter answer marks the end of the list: `true` for a
+   * revert without data or with `Panic(0x32)` ({@link isListEnd}), `false` for
+   * a value. Anything else proves neither, so it throws.
+   */
+  private listEnded(result: Result3, what: string, operation: string): boolean {
+    if (isListEnd(result)) return true;
+    if (hasValue(result)) return false;
+    const why = result.success
+      ? "returned empty data"
+      : result.revertDataMissing
+        ? "failed without revert data (a node error, not a revert)"
+        : `reverted with data that does not end a list (${result.returnData})`;
+    throw this.shapeError(
+      operation,
+      result.returnData,
+      `AccountReader: ${what} ${why} — neither a value nor the end of the list`,
+    );
+  }
+
+  private decodeKeyEntry(slot: KeySlot, results: Result3[], base: number): OnchainKeyEntry {
+    const what = (fn: string) => `${fn} for ${slot.set} key ${slot.index}`;
+    // `"unknown"` only for a type number this SDK does not know — never for a failed read.
+    const [rawKeyType] = this.decodeRequired(webAuthnIface, "keyType", results[base], what("keyType()"));
+    const keyType = keyTypeFromPrimitive(Number(rawKeyType));
+    const entry: OnchainKeyEntry = {
+      index: slot.index,
+      logicContract: slot.logic,
+      keyId: slot.keyId,
+      weight: slot.weight,
+      keyType,
     };
+    if (keyType === "zkOAuth") {
+      const data = this.decodeRequired(zkIface, "getData", results[base + 1], what("getData"));
+      const [anchor] = this.decodeRequired(zkIface, "getAnchor", results[base + 2], what("getAnchor"));
+      entry.zk = {
+        directory: data[0] as string,
+        n: data[1] as bigint,
+        k: data[2] as bigint,
+        hAudList: data[3] as bigint,
+        anchorWithHash: Array.from(anchor as Iterable<bigint>),
+      };
+    } else if (keyType === "address") {
+      const [signer] = this.decodeRequired(addressKeyIface, "getSigner", results[base + 3], what("getSigner"));
+      entry.signer = signer as string;
+    } else if (keyType === "webauthn") {
+      const d = this.decodeRequired(webAuthnIface, "getKeyData", results[base + 4], what("getKeyData"));
+      entry.webauthn = {
+        x: d[0] as string,
+        y: d[1] as string,
+        credentialId: d[2] as string,
+        allowedOriginHash: d[3] as string,
+        allowedRpIdHash: d[4] as string,
+      };
+    }
+    return entry;
+  }
+
+  /** Decode a sub-result that must be there; a revert or bad data is RESPONSE_SHAPE, never "absent". */
+  private decodeRequired(iface: ethers.Interface, fn: string, result: Result3, what: string): ethers.Result {
+    try {
+      if (!hasValue(result)) throw new Error(result.success ? "empty return data" : "call reverted");
+      return iface.decodeFunctionResult(fn, result.returnData);
+    } catch (err) {
+      throw this.shapeError(READ_KEY_STATE, result.returnData, `AccountReader: ${what} returned no usable value`, err);
+    }
+  }
+
+  /** A failure whose revert data never arrived is a node error: never read it as "no value". */
+  private requireRevertData(result: Result3, what: string, operation: string): void {
+    if (result.revertDataMissing) {
+      throw this.shapeError(operation, result.returnData, `AccountReader: ${what} failed without revert data (a node error, not a revert)`);
+    }
+  }
+
+  private shapeError(operation: string, rawResponse: string, message: string, cause?: unknown): AaFetchError {
+    return new AaFetchError({
+      code: AaFetchErrorCode.RESPONSE_SHAPE,
+      operation,
+      service: "rpc",
+      url: this.rpcUrl,
+      method: "POST",
+      rawResponse,
+      cause,
+      message,
+    });
   }
 
   private requireProvider(operation: string, method: string): ethers.Provider {

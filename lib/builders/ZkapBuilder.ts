@@ -9,6 +9,7 @@ import {
   ZkapAccountFactoryABI,
 } from "../types/abi";
 import { ethers } from "ethers";
+import { MASTER_OP_SIGNER_KEY_TYPES } from "../master/constants";
 import {
   PaymasterService,
   PaymasterServiceConfig,
@@ -60,6 +61,19 @@ export class ZkapBuilder extends BaseAccountBuilder {
    * not in validation, which is why the two profiles differ this much.
    */
   static readonly ZK_OAUTH_RS256_SINGLE_PROOF_VALIDATION_GAS = 400000n;
+
+  /**
+   * callGasLimit (before `GAS_BUFFER`) for `updateKeys` sent together with initCode, where
+   * the wallet does not exist yet and on-chain estimation is impossible.
+   *
+   * On a local test chain the smallest callGasLimit with which this `updateKeys` (installing
+   * the 3-of-6 zk + cosigner + passkey master key) succeeded was 1,202,822; this keeps
+   * roughly 1.5x of that. Under-declaring is the expensive failure: execution reverts
+   * on-chain, the op is still charged, and the wallet stays deployed with its initial keys.
+   * Over-declaring is cheap but not free: EntryPoint v0.8 charges 10% of the unused
+   * callGasLimit as a penalty. Re-measure whenever the contracts are redeployed.
+   */
+  static readonly UPDATE_KEYS_CALL_GAS = 1_800_000n;
 
   // Estimated signature sizes per key type (bytes) — used to generate dummy signatures for preVerificationGas estimation
   private static readonly ESTIMATED_SIG_SIZES: Record<number, number> = {
@@ -215,6 +229,26 @@ export class ZkapBuilder extends BaseAccountBuilder {
         data: this.userOp.callData,
         value: ethers.parseEther("0"),
       });
+      // updateKeys on a deployed wallet (resuming initialization, replacing the passkey)
+      // gets a proportional margin. On a local test chain the plain estimate + GAS_BUFFER was
+      // only ~9% (resume: smallest successful limit 1,179,660, node estimate 1,265,437) and
+      // ~18% (passkey change: 582,509 / 663,641) above the smallest limit that succeeded;
+      // × 1.2 + GAS_BUFFER leaves ~31% / ~41%. An under-declared limit reverts the execution
+      // and throws away the zk proof the user just produced.
+      // Every other selector keeps the plain estimate.
+      const updateKeysSelector = new ethers.Interface(ZkapAccountABI).getFunction("updateKeys")?.selector;
+      const callData = this.userOp.callData;
+      if (
+        updateKeysSelector &&
+        typeof callData === "string" &&
+        callData.length >= 10 &&
+        callData.slice(0, 10).toLowerCase() === updateKeysSelector.toLowerCase()
+      ) {
+        return ethers.toBeHex(
+          (callGasLimit * ZkapBuilder.GAS_ESTIMATE_MULTIPLIER) / ZkapBuilder.GAS_ESTIMATE_DIVISOR +
+            ZkapBuilder.GAS_BUFFER
+        );
+      }
       return ethers.toBeHex(callGasLimit + ZkapBuilder.GAS_BUFFER);
     } else {
       // Wallet is not deployed and no initCode provided — invalid scenario
@@ -283,22 +317,9 @@ export class ZkapBuilder extends BaseAccountBuilder {
           }
 
           case "updateKeys": {
-            // updateKeys(bytes encodedMasterKey, bytes encodedTxKey)
-            // Called with initCode during wallet creation - wallet not yet deployed, so
-            // on-chain estimateGas is impossible and the value must be measured offline.
-            //
-            // Sepolia (EntryPoint v0.8, current ZkapAccount): the execution frame used
-            // 867,516 gas in both traced deploys; across 20 deploys the callData length
-            // varied 1,636-1,732B (rpId/origin), which bounds the worst case near
-            // ~927,500. 1,300,000 keeps ~1.4x headroom.
-            //
-            // Not just a safety number: EntryPoint v0.8 charges a 10% penalty on UNUSED
-            // callGasLimit above a 40,000 threshold, so the old 2,000,000 burned ~115k
-            // gas per deploy. Headroom is cheap (10% of it) but under-declaring is not —
-            // execution then reverts ON-CHAIN and is still charged, leaving a wallet
-            // deployed with its keys un-updated. Re-measure after a contract redeploy.
-            const UPDATE_KEYS_GAS = BigInt(1300000);
-            return ethers.toBeHex((UPDATE_KEYS_GAS + ZkapBuilder.GAS_BUFFER).toString());
+            // updateKeys(bytes encodedMasterKey, bytes encodedTxKey) sent with initCode:
+            // the wallet is not deployed yet, so use the measured budget (see UPDATE_KEYS_CALL_GAS).
+            return ethers.toBeHex(ZkapBuilder.UPDATE_KEYS_CALL_GAS + ZkapBuilder.GAS_BUFFER);
           }
 
           case "updateMasterKey": {
@@ -656,10 +677,39 @@ export class ZkapBuilder extends BaseAccountBuilder {
 
   /**
    * Encodes and sets the UserOperation signature.
-   * @param keyIndexList Indices of the keys used to sign (e.g. [0] for the first key)
-   * @param keySignatureList Hex-encoded signatures returned by `signer.signUserOpHash()`
+   *
+   * Include only the signatures of the keys needed to reach the key set's threshold.
+   * The account subtracts the weight of a key whose signature is valid in form but does
+   * not verify (e.g. signed by a different signer), but a MALFORMED signature (an ECDSA
+   * signature of the wrong length, an undecodable or invalid zk proof, ...) makes
+   * verification itself revert, so the whole op fails even if the remaining signatures
+   * would reach the threshold.
+   *
+   * For master key operations the zk signature belongs to master key index 0 and must be
+   * the FIRST element of `keySignatureList`: the gas profile reads the proof count from it.
+   *
+   * @param keyIndexList Indices of the keys used to sign (e.g. `[0]` for the first key,
+   *        `[0, 1]` for a cosigned master op). Must not contain duplicates; order is not enforced.
+   * @param keySignatureList Hex-encoded signatures returned by `signer.signUserOpHash()`,
+   *        in the same order as `keyIndexList`
+   * @throws `AaOperationError` (`INPUT_OUT_OF_RANGE`) when the two lists differ in length,
+   *         (`INPUT_INVALID`) when `keyIndexList` contains a duplicate index
    */
   setSignature(keyIndexList: number[], keySignatureList: string[]): this {
+    if (keyIndexList.length !== keySignatureList.length) {
+      throw new AaOperationError({
+        code: AaOperationErrorCode.INPUT_OUT_OF_RANGE,
+        operation: "set_signature",
+        message: `keyIndexList (${keyIndexList.length}) and keySignatureList (${keySignatureList.length}) must have the same length`,
+      });
+    }
+    if (new Set(keyIndexList).size !== keyIndexList.length) {
+      throw new AaOperationError({
+        code: AaOperationErrorCode.INPUT_INVALID,
+        operation: "set_signature",
+        message: `keyIndexList must not contain duplicate indices: [${keyIndexList.join(", ")}]`,
+      });
+    }
     const defaultAbiCoder = ethers.AbiCoder.defaultAbiCoder();
 
     this.userOp.signature = defaultAbiCoder.encode(
@@ -672,11 +722,17 @@ export class ZkapBuilder extends BaseAccountBuilder {
   /**
    * Sets the callData for a tx key update.
    * @param encoded Encoded key data
-   * @warning This method forcibly sets signerKeyTypes to keyZkOAuthRS256.
-   *          Any value previously set via setSignerKeyTypes() will be overridden.
-   *          Key update transactions always require a ZK-OAuth RS256 signature.
+   * @param signerKeyTypes Signer key types of the master key signature, validated like
+   *        `setSignerKeyTypes()`. Defaults to `[keyZkOAuthRS256, keyAddress]` (zk key + cosigner).
+   *        Use e.g. `[keyZkOAuthRS256, keyWebAuthn]` when the passkey cosigns, or
+   *        `[keyZkOAuthRS256]` for a zk-only master key. Keep keyZkOAuthRS256 FIRST, matching
+   *        the zk signature at the head of the signature list.
+   * @warning This method overwrites any value previously set via setSignerKeyTypes().
    */
-  setUpdateTxKeyCallData(encoded: string): this {
+  setUpdateTxKeyCallData(
+    encoded: string,
+    signerKeyTypes?: number[]
+  ): this {
     if (!this.userOp.sender) {
       throw new AaOperationError({
         code: AaOperationErrorCode.STATE_FIELD_NOT_SET,
@@ -686,21 +742,26 @@ export class ZkapBuilder extends BaseAccountBuilder {
     }
     const callDataBuilder = new CallDataBuilder(ZkapAccountABI);
     const callData = callDataBuilder.encode("updateTxKey", [encoded]);
+    // Validate the key types before touching callData so a rejected value leaves the builder unchanged.
+    this.setSignerKeyTypes(signerKeyTypes ?? [...MASTER_OP_SIGNER_KEY_TYPES]);
     this.setCallDataInternal(callData);
-    // This method is dedicated to key update transactions, so it forcibly overrides signerKeyTypes to keyZkOAuthRS256.
-    // Any value previously set via setSignerKeyTypes() will be invalidated.
-    this.signerKeyTypes = [PrimitiveAccountKeyTypes.keyZkOAuthRS256];
     return this;
   }
 
   /**
    * Sets the callData for a master key update.
    * @param encoded Encoded key data
-   * @warning This method forcibly sets signerKeyTypes to keyZkOAuthRS256.
-   *          Any value previously set via setSignerKeyTypes() will be overridden.
-   *          Key update transactions always require a ZK-OAuth RS256 signature.
+   * @param signerKeyTypes Signer key types of the master key signature, validated like
+   *        `setSignerKeyTypes()`. Defaults to `[keyZkOAuthRS256, keyAddress]` (zk key + cosigner).
+   *        Use e.g. `[keyZkOAuthRS256, keyWebAuthn]` when the passkey cosigns, or
+   *        `[keyZkOAuthRS256]` for a zk-only master key. Keep keyZkOAuthRS256 FIRST, matching
+   *        the zk signature at the head of the signature list.
+   * @warning This method overwrites any value previously set via setSignerKeyTypes().
    */
-  setUpdateMasterKeyCallData(encoded: string): this {
+  setUpdateMasterKeyCallData(
+    encoded: string,
+    signerKeyTypes?: number[]
+  ): this {
     if (!this.userOp.sender) {
       throw new AaOperationError({
         code: AaOperationErrorCode.STATE_FIELD_NOT_SET,
@@ -710,10 +771,9 @@ export class ZkapBuilder extends BaseAccountBuilder {
     }
     const callDataBuilder = new CallDataBuilder(ZkapAccountABI);
     const callData = callDataBuilder.encode("updateMasterKey", [encoded]);
+    // Validate the key types before touching callData so a rejected value leaves the builder unchanged.
+    this.setSignerKeyTypes(signerKeyTypes ?? [...MASTER_OP_SIGNER_KEY_TYPES]);
     this.setCallDataInternal(callData);
-    // This method is dedicated to key update transactions, so it forcibly overrides signerKeyTypes to keyZkOAuthRS256.
-    // Any value previously set via setSignerKeyTypes() will be invalidated.
-    this.signerKeyTypes = [PrimitiveAccountKeyTypes.keyZkOAuthRS256];
     return this;
   }
 
@@ -721,11 +781,17 @@ export class ZkapBuilder extends BaseAccountBuilder {
    * Sets the callData for simultaneously updating both master key and tx key.
    * @param encodedMasterKey Encoded master key data
    * @param encodedTxKey Encoded tx key data
-   * @warning This method forcibly sets signerKeyTypes to keyZkOAuthRS256.
-   *          Any value previously set via setSignerKeyTypes() will be overridden.
-   *          Key update transactions always require a ZK-OAuth RS256 signature.
+   * @param signerKeyTypes Signer key types of the master key signature, validated like
+   *        `setSignerKeyTypes()`. Defaults to `[keyZkOAuthRS256, keyAddress]` (zk key + cosigner).
+   *        Use e.g. `[keyZkOAuthRS256, keyWebAuthn]` when the passkey cosigns, or
+   *        `[keyZkOAuthRS256]` for a zk-only master key. Keep keyZkOAuthRS256 FIRST, matching
+   *        the zk signature at the head of the signature list.
+   * @warning This method overwrites any value previously set via setSignerKeyTypes().
    */
-  setUpdateKeysCallData(keys: { encodedMasterKey: string; encodedTxKey: string }): this {
+  setUpdateKeysCallData(
+    keys: { encodedMasterKey: string; encodedTxKey: string },
+    signerKeyTypes?: number[]
+  ): this {
     const { encodedMasterKey, encodedTxKey } = keys;
     if (!this.userOp.sender) {
       throw new AaOperationError({
@@ -739,10 +805,9 @@ export class ZkapBuilder extends BaseAccountBuilder {
       encodedMasterKey,
       encodedTxKey,
     ]);
+    // Validate the key types before touching callData so a rejected value leaves the builder unchanged.
+    this.setSignerKeyTypes(signerKeyTypes ?? [...MASTER_OP_SIGNER_KEY_TYPES]);
     this.setCallDataInternal(callData);
-    // This method is dedicated to key update transactions, so it forcibly overrides signerKeyTypes to keyZkOAuthRS256.
-    // Any value previously set via setSignerKeyTypes() will be invalidated.
-    this.signerKeyTypes = [PrimitiveAccountKeyTypes.keyZkOAuthRS256];
     return this;
   }
 

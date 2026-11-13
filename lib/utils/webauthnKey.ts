@@ -94,3 +94,44 @@ export function toJwkPublicKey({ x, y }: P256Coordinates): EcP256Jwk {
     toURLEncode(ethers.encodeBase64(ethers.getBytes(normalizeBytes32(coordinate))));
   return { kty: "EC", crv: "P-256", x: encode(x), y: encode(y) };
 }
+
+/** Fields of a WebAuthn key registration, with the public key as P-256 coordinates. */
+export interface WebAuthnKeyInitFields {
+  /** 32-byte hex coordinates. */
+  x: string;
+  y: string;
+  credentialId: string;
+  /** 32-byte hex `SHA-256(rpId)`. */
+  rpIdHash: string;
+  origin: string;
+  requireUV: boolean;
+}
+
+/**
+ * `AccountKeyWebAuthn.register` init data:
+ * `abi.encode(bytes abi.encode((bytes32 x, bytes32 y, string credentialId)), bytes32 rpIdHash, bytes origin, bool requireUV)`.
+ *
+ * The single encoder for a WebAuthn key: the COSE path of `AccountKeyBuilder` and the
+ * passkey slots of the master/tx key builders both end here, so the same key always
+ * encodes to the same bytes.
+ */
+export function encodeWebAuthnKeyInitData({
+  x,
+  y,
+  credentialId,
+  rpIdHash,
+  origin,
+  requireUV,
+}: WebAuthnKeyInitFields): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  const encodedKey = abiCoder.encode(["tuple(bytes32,bytes32,string)"], [[x, y, credentialId]]);
+  return abiCoder.encode(
+    ["bytes", "bytes32", "bytes", "bool"],
+    [
+      encodedKey,
+      ethers.hexlify(ethers.getBytes(rpIdHash)),
+      ethers.hexlify(ethers.toUtf8Bytes(origin)),
+      requireUV,
+    ]
+  );
+}

@@ -28,6 +28,17 @@ export interface Call3 {
 export interface Result3 {
   success: boolean;
   returnData: string;
+  /**
+   * Set (to `true`) only on the per-call path, for a call whose error
+   * `isRevertError` accepted but that carried no revert data (`err.data` not a
+   * string). `returnData` is then `"0x"`, but nobody saw the call revert with
+   * empty data: ethers v6 reports a node error (rate limit, `header not
+   * found`, …) to `eth_call` the same way, with `data: null`. Such a result is
+   * neither a value nor the end of a key list; the reader fails instead.
+   * Absent on every Multicall3 result: a sub-call of `aggregate3` that failed
+   * did revert with exactly `returnData`.
+   */
+  revertDataMissing?: true;
 }
 
 /** Multicall3 — deployed at the same address on every major chain. */
@@ -48,6 +59,36 @@ export function hasValue(result: Result3): boolean {
   return result.success && result.returnData !== "0x" && result.returnData.length > 2;
 }
 
+/** Solidity `Panic(0x32)`: array index out of bounds. */
+const PANIC_ARRAY_OUT_OF_BOUNDS = "0x4e487b71" + "32".padStart(64, "0");
+
+/**
+ * Did this sub-call revert with Solidity `Panic(0x32)` (array index out of
+ * bounds)? Code that indexes an array (`arr[i]`) panics this way past its end.
+ */
+export function isArrayOutOfBounds(result: Result3): boolean {
+  return !result.success && result.returnData.toLowerCase() === PANIC_ARRAY_OUT_OF_BOUNDS;
+}
+
+/**
+ * Does this answer of a key-list getter (`masterKeyList(i)`, `txKeyList(i)`, their
+ * weight lists) mark the end of the list?
+ *
+ * - A revert seen to carry **no data**. The compiler-generated getter of a public
+ *   array reverts this way past the end of the array — that is what the
+ *   ZkapAccount bytecode shipped in this package answers.
+ * - A revert with `Panic(0x32)` ({@link isArrayOutOfBounds}), which the same
+ *   getter would answer if compiled to index the array explicitly.
+ *
+ * Not the end: a value, empty data on success, any other revert data
+ * (`Error(string)`, another `Panic`), and a failure whose revert data was never
+ * received (`revertDataMissing` — a node error on the per-call path).
+ */
+export function isListEnd(result: Result3): boolean {
+  if (result.success || result.revertDataMissing) return false;
+  return result.returnData === "0x" || isArrayOutOfBounds(result);
+}
+
 export interface BatchCallerOptions {
   call: EthCall;
   /**
@@ -59,10 +100,35 @@ export interface BatchCallerOptions {
   /** Multicall3 address; `false` disables batching and always calls per slot. */
   multicallAddress?: string | false;
   /**
-   * Classifies an error thrown by `call` on the per-call fallback path as a
-   * revert (end of list) rather than a transport failure. Defaults to
-   * `ethers.isCallException`, which recognises ethers' errors; a raw JSON-RPC
-   * proxy needs its own (only matters on chains without Multicall3).
+   * Classifies an error thrown by `call` on the per-call fallback path (chains
+   * without Multicall3): `true` means "the contract call reverted", and the
+   * error's `data` must then be the revert data as a hex string — `"0x"` for a
+   * revert without data. Such an error becomes
+   * `{ success: false, returnData: err.data }`. An accepted error whose `data`
+   * is not a string becomes `{ success: false, returnData: "0x",
+   * revertDataMissing: true }`: a failure whose revert data is unknown, which
+   * the reader never takes as a value or as the end of a key list. Any error
+   * classified `false` throws `AaFetchError` (`TRANSPORT`). Defaults to
+   * `ethers.isCallException`.
+   *
+   * With ethers v6, a revert the node answers WITH a `data` field carries it
+   * through, `"0x"` included, while every other JSON-RPC `error` answer to
+   * `eth_call` (rate limit, `header not found`, …) is also a `CALL_EXCEPTION`,
+   * but with `data: null` — so the default keeps the two apart through `data`.
+   * This was observed against a local anvil node, which answers a revert
+   * without data as `{ code: 3, data: "0x" }`. Nodes differ: one that answers
+   * such a revert with no `data` field at all is indistinguishable from a node
+   * error here, so on this per-call path every key list read fails (it never
+   * reads as an empty list). Chains with Multicall3 are not affected.
+   *
+   * A custom classifier must keep the same distinction: return `true` only for
+   * a revert, and pass its revert data through in `data`. The key-list getters
+   * revert without data past the end of a list, so a classifier that drops
+   * revert data turns every list end into a failed read; one that reports a
+   * node error as a revert with `data: "0x"` makes a node error look like the
+   * end of a list. Expect reverts in ordinary reads, too: `readKeyState` asks
+   * each key's logic contract for the getters of every key type, and the ones
+   * that do not match the key's type revert.
    */
   isRevertError?: (err: unknown) => boolean;
   /** Surfaced as `AaFetchError.url` for diagnostics (rpcUrl mode). */
@@ -96,6 +162,7 @@ export class BatchCaller {
     return this._multicallAvailable;
   }
 
+  /** Run one round of calls. */
   async batch(calls: Call3[], operation: string): Promise<{ results: Result3[]; via: ReadVia }> {
     const multicallAddress = this.multicallAddress;
     if (multicallAddress !== false && this._multicallAvailable !== false) {
@@ -183,7 +250,9 @@ export class BatchCaller {
         } catch (err) {
           if (this.isRevertError(err)) {
             const data = (err as { data?: unknown }).data;
-            return { success: false, returnData: typeof data === "string" ? data : "0x" };
+            return typeof data === "string"
+              ? { success: false, returnData: data }
+              : { success: false, returnData: "0x", revertDataMissing: true };
           }
           throw this.transportError(operation, err, `AccountReader: eth_call to ${c.target} failed`);
         }

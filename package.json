@@ -1,6 +1,6 @@
 {
   "name": "@baerae/zkap-aa",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "ZKAP Account Abstraction SDK — ERC-4337 smart wallet, passkey, zk-oidc signers.",
   "keywords": [
     "erc-4337",
@@ -51,6 +51,7 @@
     "dist/lib/",
     "dist/esm/",
     "LICENSE",
+    "fixtures/",
     "README.md",
     "package.json"
   ],
@@ -69,7 +70,8 @@
       "types": "./dist/lib/index.d.ts",
       "import": "./dist/esm/index.js",
       "require": "./dist/lib/index.js"
-    }
+    },
+    "./fixtures/master-key-cosign-vectors.json": "./fixtures/master-key-cosign-vectors.json"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",

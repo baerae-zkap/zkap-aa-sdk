@@ -42,6 +42,7 @@ lib/
 ├── client/           # BundlerClient, BundlerProvider
 ├── config/           # ZkapProviderConfig
 ├── helper/           # TxKeyHelper
+├── master/           # Cosigned master key: layouts, builders, parsers, on-chain classification
 ├── reader/           # AccountReader, passkeys (classification), transport (Multicall3), types
 ├── signers/          # PasskeySigner, ZkOidcSigner, AddressKeySigner
 ├── types/            # TypeScript types and ABI JSON
@@ -73,6 +74,22 @@ export class YourSigner implements IUserOpSigner {
 - Keep test coverage above 95% for statements and functions
 - Use `jest.fn()` for external calls (network, WebAuthn, proof servers)
 - Do not mock internal utilities — test them directly
+
+### Captured contract answers (AccountReader)
+
+`lib/reader/__tests__/fixtures/reader-capture.json` holds the raw `eth_call`
+answers of the contract bytecode in `lib/types/abi/*.json`, captured on a local
+anvil. The replay tests read it without anvil; nothing in CI starts a chain.
+Whenever the contract artifacts in `lib/types/abi/` change, regenerate it
+(needs `anvil` from [Foundry](https://book.getfoundry.sh/getting-started/installation)
+on `PATH`) and commit the result:
+
+```bash
+node scripts/capture-reader-fixture.mjs
+```
+
+The output is deterministic — running it twice gives the same file. The replay
+test fails while the captured bytecode hashes differ from the artifacts.
 
 ## Pull request checklist
 
