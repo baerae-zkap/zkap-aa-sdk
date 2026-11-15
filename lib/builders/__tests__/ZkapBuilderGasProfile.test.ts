@@ -311,9 +311,29 @@ describe("ZkapBuilder gas profile (real ABI coding)", () => {
       });
     });
 
-    describe("deployed wallet + any other selector: estimate + 25,000 (unchanged)", () => {
+    describe("deployed wallet + updateMasterKey: estimate * 120 / 100 + 25,000", () => {
+      const UPDATE_MASTER_KEY_CALL_DATA = ACCOUNT_IFACE.encodeFunctionData("updateMasterKey", [ENCODED_MASTER_KEY]);
+
+      it.each([
+        [1_265_437n, 1_543_524n],
+        [663_641n, 821_369n],
+        [100_004n, 145_004n], // integer division floors
+      ])("estimate %s → %s", async (estimate, expected) => {
+        const builder = await buildDeployed(UPDATE_MASTER_KEY_CALL_DATA, estimate);
+
+        expect(BigInt(builder.getUserOp().callGasLimit)).toBe(expected);
+      });
+
+      it("matches the updateMasterKey selector case-insensitively", async () => {
+        const upper = "0x" + UPDATE_MASTER_KEY_CALL_DATA.slice(2).toUpperCase();
+        const builder = await buildDeployed(upper, 1_265_437n);
+
+        expect(BigInt(builder.getUserOp().callGasLimit)).toBe(1_543_524n);
+      });
+    });
+
+    describe("deployed wallet + any other selector (not updateKeys / updateMasterKey): estimate + 25,000 (unchanged)", () => {
       const otherCallData: Array<[string, string]> = [
-        ["updateMasterKey", ACCOUNT_IFACE.encodeFunctionData("updateMasterKey", [ENCODED_MASTER_KEY])],
         ["updateTxKey", ACCOUNT_IFACE.encodeFunctionData("updateTxKey", [ENCODED_TX_KEY])],
         ["execute", ACCOUNT_IFACE.encodeFunctionData("execute", [SENDER, 0n, "0x"])],
       ];

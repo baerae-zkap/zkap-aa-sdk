@@ -3,9 +3,10 @@
  * on-chain read (`readKeyState`) followed by the pure functions, against a
  * strict fake chain that answers only through the package's generated ABIs.
  */
+import { ethers } from "ethers";
 import { AccountReader } from "../../reader/AccountReader";
 import { AaFetchError, AaOperationError } from "../../errors";
-import type { MasterKeyExpectation, ReconstructOperationalMasterKeyParams } from "../onchain";
+import type { MasterKeyCosigners, MasterKeyExpectation, ReconstructOperationalMasterKeyParams } from "../onchain";
 import type { PasskeyKeyInput } from "../encoding";
 import {
   strictChain,
@@ -180,6 +181,83 @@ describe("AccountReader master key classification and reconstruction", () => {
       });
       await expectRejected(reader.classifyMasterKey(ACCOUNT, EXPECTED), AaFetchError);
       await expectRejected(reader.reconstructOperationalMasterKey(ACCOUNT, params(inputs.newPasskey)), AaFetchError);
+    });
+  });
+});
+
+describe("AccountReader with the split cosigner form", () => {
+  const SYN_INITIAL = "0x" + "a1".repeat(20);
+  const SYN_OP = "0x" + "b2".repeat(20);
+
+  // Compile-time check: an `as const` tuple is accepted as `readonly string[]`.
+  const OPERATIONAL_TUPLE = [SYN_OP, inputs.cosigner] as const;
+  const COSIGNERS: MasterKeyCosigners = { initial: SYN_INITIAL, operational: OPERATIONAL_TUPLE };
+  const SPLIT: MasterKeyExpectation = { contracts: EXPECTED.contracts, cosigner: COSIGNERS };
+
+  /** The `[1]` signer of an encoded operational master key, decoded with AbiCoder. */
+  const cosignerOf = (encoded: string): string => {
+    const coder = ethers.AbiCoder.defaultAbiCoder();
+    const [, , initDataList] = coder.decode(["uint8", "address[]", "bytes[]", "uint8[]"], encoded);
+    return coder.decode(["address"], initDataList[1])[0] as string;
+  };
+
+  describe("classifyMasterKey", () => {
+    it("reads an operational wallet whose [1] is the second address of the list as operational", async () => {
+      const result = await readerOn(strictChain(ACCOUNT, vectorKeyState("operational"))).classifyMasterKey(ACCOUNT, SPLIT);
+      expect(result.kind).toBe("operational");
+      expect(result.reasons).toEqual([]);
+    });
+
+    it("reads the initial wallet as initial when `initial` is its cosigner", async () => {
+      const expected: MasterKeyExpectation = {
+        contracts: EXPECTED.contracts,
+        cosigner: { initial: inputs.cosigner, operational: [SYN_OP] },
+      };
+      const result = await readerOn(strictChain(ACCOUNT, initialState())).classifyMasterKey(ACCOUNT, expected);
+      expect(result.kind).toBe("initial");
+      expect(result.reasons).toEqual([]);
+    });
+
+    it("reads an operational wallet whose [1] is not in the list as other", async () => {
+      const result = await readerOn(strictChain(ACCOUNT, otherState())).classifyMasterKey(ACCOUNT, SPLIT);
+      expect(result.kind).toBe("other");
+      expect(result.reasons.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("reconstructOperationalMasterKey", () => {
+    it("installs the chain's own [1] signer, not the first address of the list", async () => {
+      const chain = strictChain(ACCOUNT, vectorKeyState("operational"));
+      const result = await readerOn(chain).reconstructOperationalMasterKey(ACCOUNT, { ...SPLIT, passkey: xyPasskey(inputs.newPasskey) });
+      expect(cosignerOf(result.encodedMasterKey).toLowerCase()).toBe(inputs.cosigner.toLowerCase());
+      expect(cosignerOf(result.encodedMasterKey).toLowerCase()).not.toBe(SYN_OP.toLowerCase());
+      expect(result.encodedMasterKey).toBe(outputs.reconstructedMaster);
+    });
+
+    it("installs a synthetic on-chain signer that is later in the list", async () => {
+      const expected: MasterKeyExpectation = {
+        contracts: EXPECTED.contracts,
+        cosigner: { initial: SYN_INITIAL, operational: [SYN_OP, OTHER_ADDRESS] },
+      };
+      const result = await readerOn(strictChain(ACCOUNT, otherState())).reconstructOperationalMasterKey(ACCOUNT, {
+        ...expected,
+        passkey: xyPasskey(inputs.newPasskey),
+      });
+      expect(cosignerOf(result.encodedMasterKey).toLowerCase()).toBe(OTHER_ADDRESS.toLowerCase());
+    });
+
+    it("rejects an overlapping expectation with AaOperationError", async () => {
+      const expected: MasterKeyExpectation = {
+        contracts: EXPECTED.contracts,
+        cosigner: { initial: inputs.cosigner, operational: [SYN_OP, inputs.cosigner.toLowerCase()] },
+      };
+      await expectRejected(
+        readerOn(strictChain(ACCOUNT, vectorKeyState("operational"))).reconstructOperationalMasterKey(ACCOUNT, {
+          ...expected,
+          passkey: xyPasskey(inputs.newPasskey),
+        }),
+        AaOperationError,
+      );
     });
   });
 });

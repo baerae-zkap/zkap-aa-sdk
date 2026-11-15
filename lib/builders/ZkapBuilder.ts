@@ -235,14 +235,20 @@ export class ZkapBuilder extends BaseAccountBuilder {
       // ~18% (passkey change: 582,509 / 663,641) above the smallest limit that succeeded;
       // × 1.2 + GAS_BUFFER leaves ~31% / ~41%. An under-declared limit reverts the execution
       // and throws away the zk proof the user just produced.
+      // updateMasterKey on a deployed wallet gets the same margin; its margin has not
+      // been measured.
       // Every other selector keeps the plain estimate.
-      const updateKeysSelector = new ethers.Interface(ZkapAccountABI).getFunction("updateKeys")?.selector;
+      const accountInterface = new ethers.Interface(ZkapAccountABI);
+      const marginSelectors = ["updateKeys", "updateMasterKey"].map(
+        (name) => accountInterface.getFunction(name)?.selector
+      );
       const callData = this.userOp.callData;
       if (
-        updateKeysSelector &&
         typeof callData === "string" &&
         callData.length >= 10 &&
-        callData.slice(0, 10).toLowerCase() === updateKeysSelector.toLowerCase()
+        marginSelectors.some(
+          (selector) => selector && callData.slice(0, 10).toLowerCase() === selector.toLowerCase()
+        )
       ) {
         return ethers.toBeHex(
           (callGasLimit * ZkapBuilder.GAS_ESTIMATE_MULTIPLIER) / ZkapBuilder.GAS_ESTIMATE_DIVISOR +

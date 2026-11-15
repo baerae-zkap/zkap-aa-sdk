@@ -441,6 +441,9 @@ export class AccountReader {
   /**
    * Read the account's key state ({@link readKeyState}) and classify its master
    * key ({@link classifyMasterKey}). Resolves with the state that was classified.
+   * `expected.cosigner` may be one address for both layouts or, when wallets are
+   * deployed with one cosigner and operated with another, the split form
+   * `{ initial, operational }` (`MasterKeyCosigners`).
    *
    * @throws `AaFetchError` when the read fails — a failed read is never reported
    *   as `"other"`.
@@ -457,6 +460,9 @@ export class AccountReader {
    * Read the account's key state ({@link readKeyState}) and rebuild its
    * operational master key with `params.passkey` ({@link reconstructOperationalMasterKey}).
    * Resolves with the encoded master key and the state it was rebuilt from.
+   * `params.cosigner` may take the split form `{ initial, operational }`; the
+   * rebuilt key then keeps the wallet's own on-chain cosigner, never another
+   * address from `operational`.
    *
    * The result is only as current as this read: use it right away, and re-check
    * the wallet's key state before submitting it. It is valid only for
