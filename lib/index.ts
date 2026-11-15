@@ -86,6 +86,7 @@ export type {
 } from "./master/parsing";
 export { classifyMasterKey, reconstructOperationalMasterKey } from "./master/onchain";
 export type {
+  MasterKeyCosigners,
   MasterKeyExpectation,
   MasterKeyKind,
   MasterKeyClassification,

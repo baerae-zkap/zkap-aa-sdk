@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
+Lets `classifyMasterKey` and `reconstructOperationalMasterKey` take a separate
+deployment cosigner and a list of operating cosigners, and gives
+`updateMasterKey` on a deployed wallet the same callGasLimit margin as
+`updateKeys`.
+
+**Why:** a service can deploy wallets with one cosigner and operate them with
+another. The cosigner of the initial master key is fixed at deployment — it is
+part of the wallet address — while the cosigner of the operational master key
+can be rotated, so different wallets may carry different operational
+cosigners, all from an accepted list. In 0.3.0 both functions take a single
+`cosigner` and use it for both layouts. A caller could call twice and combine
+the answers, but a wrong reconstruction locks a wallet's master key for good,
+so that combination now lives in the SDK, in one place.
+
+### Added
+
+- **Split form of `MasterKeyExpectation.cosigner`** — `cosigner` also accepts
+  `{ initial, operational }` (type `MasterKeyCosigners`, exported). The `[1]`
+  signer of an initial master key must equal `initial`; the `[1]` signer of an
+  operational master key must be one of `operational`. Addresses are compared
+  case-insensitively, as before. A malformed split form (a missing or
+  non-address `initial`, an `operational` that is not a non-empty list of
+  addresses) matches nothing: a deployed wallet classifies as `"other"`.
+- **Overlapping input is reported, not thrown.** When `operational` contains
+  `initial`, the check that keeps the deployment cosigner out of an
+  operational master key (and an operational cosigner out of an initial one)
+  could no longer fail. `classifyMasterKey` then returns `"other"` with one
+  reason (`cosigner expectation: initial cosigner … is also an operational
+  cosigner`) for every state, an undeployed account included, and never
+  throws; `reconstructOperationalMasterKey` refuses with `AaOperationError`
+  (`INPUT_INVALID`) carrying that reason.
+- **Reconstruction keeps the wallet's own cosigner.** In the split form,
+  `reconstructOperationalMasterKey` installs the wallet's on-chain `[1]` signer
+  — which classification has confirmed is in `operational` — never another
+  address from the list. The `AccountReader` wrappers of both functions accept
+  the split form unchanged.
+
+### Changed
+
+- **`updateMasterKey` on a deployed wallet**: `autoFillUserOp()` now sets
+  callGasLimit to estimate × 1.2 + 25,000 (was estimate + 25,000), the margin
+  `updateKeys` already had. No code change is needed by callers; the declared
+  limit is higher. This margin has not been measured for `updateMasterKey`.
+  The fixed budget for `updateMasterKey` on an undeployed wallet with initCode
+  is unchanged.
+
+### Unchanged
+
+- Builders, parsers, constants, dummy signatures and the known-answer vectors.
+- The string form of `cosigner`: same classifications, reason strings,
+  reconstructed bytes and errors as 0.3.0. Code that passes a string compiles
+  as before; code that reads `.cosigner` back from a value typed
+  `MasterKeyExpectation` now gets `string | MasterKeyCosigners` and has to
+  narrow it.
+- The known-answer vectors use one cosigner for both layouts, so classify
+  vector states with the string form.
+
 ## [0.3.0] - 2026-11-13
 
 Adds builders, parsers and an on-chain reader for the cosigned master key, and

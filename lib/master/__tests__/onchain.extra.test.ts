@@ -220,3 +220,59 @@ describe("reconstructOperationalMasterKey errors", () => {
     expect((thrown as AaOperationError).operation).toBe("build_operational_master_key");
   });
 });
+
+describe("split cosigner form on malformed input", () => {
+  const SYN_INITIAL = "0x" + "a1".repeat(20);
+  const SYN_OP = "0x" + "b2".repeat(20);
+
+  const withCosigner = (cosigner: unknown) => ({ ...EXPECTED, cosigner }) as unknown as MasterKeyExpectation;
+
+  const malformed: Array<[string, unknown]> = [
+    ["cosigner: null", null],
+    ["cosigner: {}", {}],
+    ["initial only", { initial: SYN_INITIAL }],
+    ["operational only (initial missing)", { operational: [inputs.cosigner] }],
+    ["operational a string", { initial: SYN_INITIAL, operational: inputs.cosigner }],
+    ["operational: []", { initial: SYN_INITIAL, operational: [] }],
+    ["operational holding non-strings", { initial: SYN_INITIAL, operational: [42, null, { address: inputs.cosigner }] }],
+    ["operational holding non-hex strings", { initial: SYN_INITIAL, operational: ["cosigner", "0xZZ"] }],
+    ["operational holding a non-string beside the on-chain cosigner", { initial: SYN_INITIAL, operational: [42, inputs.cosigner] }],
+    ["operational a sparse list beside the on-chain cosigner", { initial: SYN_INITIAL, operational: [, inputs.cosigner] }],
+    ["initial not hex", { initial: "cosigner", operational: [inputs.cosigner] }],
+    ["initial a number", { initial: 1, operational: [inputs.cosigner] }],
+  ];
+
+  it.each(malformed)("%s: classifies the operational state as other without throwing", (_label, cosigner) => {
+    const expected = withCosigner(cosigner);
+    let c: ReturnType<typeof classifyMasterKey> | undefined;
+    expect(() => {
+      c = classifyMasterKey(operationalState(), expected);
+    }).not.toThrow();
+    expect(c?.kind).toBe("other");
+    expect(c?.reasons.length).toBeGreaterThan(0);
+  });
+
+  it.each(malformed)("%s: reconstruction is refused with AaOperationError", (_label, cosigner) => {
+    expect(refusal(operationalState(), withCosigner(cosigner)).code).toBe(AaOperationErrorCode.INPUT_INVALID);
+  });
+
+  it("an object initial with an operational list also classifies as other", () => {
+    const c = classifyMasterKey(operationalState(), withCosigner({ initial: { a: 1 }, operational: [SYN_OP, inputs.cosigner] }));
+    expect(c.kind).toBe("other");
+  });
+
+  it("a malformed split form names itself in the reasons", () => {
+    const { reasons } = classifyMasterKey(operationalState(), withCosigner({ initial: SYN_INITIAL, operational: [] }));
+    expect(reasons).toContain(
+      `not operational master key: master[1] cosigner: malformed cosigner expectation {"initial":"${SYN_INITIAL}","operational":[]}, got "${inputs.cosigner}"`,
+    );
+  });
+
+  it("a malformed split form with an undeployed state still reads undeployed", () => {
+    const state = { ...operationalState(), deployed: false };
+    expect(classifyMasterKey(state, withCosigner({ initial: SYN_INITIAL, operational: [] }))).toEqual({
+      kind: "undeployed",
+      reasons: [],
+    });
+  });
+});

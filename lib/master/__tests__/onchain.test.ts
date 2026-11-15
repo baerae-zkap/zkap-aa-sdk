@@ -22,6 +22,7 @@ import {
   classifyMasterKey,
   reconstructOperationalMasterKey,
   type MasterKeyClassification,
+  type MasterKeyCosigners,
   type MasterKeyExpectation,
   type MasterKeyKind,
   type ReconstructOperationalMasterKeyParams,
@@ -1042,6 +1043,217 @@ describe("onchain master key — classify and reconstruct", () => {
       ];
       expect(results.map((r) => r.kind)).toEqual(["undeployed", "initial", "operational", "other"]);
       results.forEach(expectReasons);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Split cosigner form: { initial, operational }
+// ---------------------------------------------------------------------------
+
+describe("onchain master key — split cosigner form", () => {
+  const INITIAL = ethers.getAddress("0x" + "a1".repeat(20));
+  const OP_A = ethers.getAddress("0x" + "b2".repeat(20));
+  const OP_B = ethers.getAddress("0x" + "c3".repeat(20));
+  const STRANGER = ethers.getAddress("0x" + "d4".repeat(20));
+  const upperHex = (address: string) => "0x" + address.slice(2).toUpperCase();
+
+  const split = (cosigner: MasterKeyCosigners): MasterKeyExpectation => ({ contracts: VECTOR_CONTRACTS, cosigner });
+  const SPLIT = split({ initial: INITIAL, operational: [OP_A, OP_B] });
+  const overlapReason = (initial: string) =>
+    `cosigner expectation: initial cosigner ${JSON.stringify(initial)} is also an operational cosigner`;
+
+  const withSigner = (base: () => OnchainKeyState, signer: string): OnchainKeyState =>
+    withState(base, (s) => void (s.master.keys[1].signer = signer));
+
+  const newPlainPasskey = (): PlainPasskey => {
+    const p = inputs.newPasskey;
+    return { x: p.x, y: p.y, credentialId: p.credentialId, rpIdHash: p.rpIdHash, origin: p.origin };
+  };
+  const independentWithCosigner = (cosigner: string) => {
+    const zk = inputs.operationalMaster.zk;
+    return independentOperationalMaster({
+      ...VECTOR_CONTRACTS,
+      hAudList: BigInt(zk.hAudList),
+      anchor: outputs.onchainGetAnchor.slice(0, -1).map((a) => BigInt(a)),
+      cosigner,
+      passkey: newPlainPasskey(),
+    });
+  };
+
+  describe("classifyMasterKey", () => {
+    it("initial wallet whose [1] is the initial cosigner → initial", () => {
+      const c = classifyMasterKey(withSigner(vectorInitialState, INITIAL), SPLIT);
+      expect(c).toEqual({ kind: "initial", reasons: [] });
+    });
+
+    it.each([
+      ["OP_A", OP_A],
+      ["OP_B", OP_B],
+    ])("initial wallet whose [1] is an operational cosigner (%s) → other", (_name, signer) => {
+      const c = classifyMasterKey(withSigner(vectorInitialState, signer), SPLIT);
+      expect(c.kind).toBe("other");
+      expect(c.reasons).toContain(
+        `not initial master key: master[1] cosigner: expected ${JSON.stringify(INITIAL)}, got ${JSON.stringify(signer)}`,
+      );
+      expectReasons(c);
+    });
+
+    it.each([
+      ["OP_A", OP_A],
+      ["OP_B", OP_B],
+    ])("operational wallet whose [1] is %s → operational", (_name, signer) => {
+      const c = classifyMasterKey(withSigner(vectorOperationalState, signer), SPLIT);
+      expect(c).toEqual({ kind: "operational", reasons: [] });
+    });
+
+    it("operational wallet whose [1] is the initial cosigner → other", () => {
+      const c = classifyMasterKey(withSigner(vectorOperationalState, INITIAL), SPLIT);
+      expect(c.kind).toBe("other");
+      expect(c.reasons).toContain(
+        `not operational master key: master[1] cosigner: expected one of ${JSON.stringify([OP_A, OP_B])}, got ${JSON.stringify(INITIAL)}`,
+      );
+      expectReasons(c);
+    });
+
+    it("operational wallet whose [1] is not in the list → other, with the list in the reason", () => {
+      const c = classifyMasterKey(withSigner(vectorOperationalState, STRANGER), SPLIT);
+      expect(c.kind).toBe("other");
+      expect(c.reasons).toContain(
+        `not operational master key: master[1] cosigner: expected one of ["${OP_A}","${OP_B}"], got "${STRANGER}"`,
+      );
+      expectReasons(c);
+    });
+
+    it("an undeployed account → undeployed", () => {
+      expect(classifyMasterKey(cloneState(UNDEPLOYED_STATE), SPLIT)).toEqual({ kind: "undeployed", reasons: [] });
+    });
+
+    describe("overlapping expectation (initial is also operational)", () => {
+      const overlaps: Array<[string, MasterKeyExpectation]> = [
+        ["same case", split({ initial: INITIAL, operational: [OP_A, INITIAL] })],
+        ["lower-case in the list", split({ initial: INITIAL, operational: [INITIAL.toLowerCase(), OP_B] })],
+        ["upper-case hex initial", split({ initial: upperHex(INITIAL), operational: [OP_A, INITIAL] })],
+      ];
+      const states: Array<[string, () => OnchainKeyState]> = [
+        ["undeployed", () => cloneState(UNDEPLOYED_STATE)],
+        ["initial", () => withSigner(vectorInitialState, INITIAL)],
+        ["operational", () => withSigner(vectorOperationalState, OP_A)],
+        ["operational, [1] = INITIAL", () => withSigner(vectorOperationalState, INITIAL)],
+      ];
+
+      for (const [overlapName, expected] of overlaps) {
+        const initial = (expected.cosigner as MasterKeyCosigners).initial;
+        it.each(states)(`${overlapName}: %s state → other with exactly the overlap reason`, (_name, state) => {
+          expect(classifyMasterKey(state(), expected)).toEqual({ kind: "other", reasons: [overlapReason(initial)] });
+        });
+
+        it(`${overlapName}: reconstruction is refused with the overlap reason`, () => {
+          const p = params(xyPasskey(inputs.newPasskey), expected);
+          expectRefused(withSigner(vectorOperationalState, OP_A), p);
+          expect(() => reconstructOperationalMasterKey(withSigner(vectorOperationalState, OP_A), p)).toThrow(
+            overlapReason(initial),
+          );
+        });
+      }
+    });
+
+    describe("case-insensitive matching", () => {
+      it("list in lower case, chain checksummed", () => {
+        const expected = split({ initial: INITIAL.toLowerCase(), operational: [OP_A.toLowerCase(), OP_B.toLowerCase()] });
+        expect(classifyMasterKey(withSigner(vectorOperationalState, OP_B), expected).kind).toBe("operational");
+        expect(classifyMasterKey(withSigner(vectorInitialState, INITIAL), expected).kind).toBe("initial");
+      });
+
+      it("list checksummed, chain in lower case / upper-case hex", () => {
+        expect(classifyMasterKey(withSigner(vectorOperationalState, OP_B.toLowerCase()), SPLIT).kind).toBe("operational");
+        expect(classifyMasterKey(withSigner(vectorOperationalState, upperHex(OP_A)), SPLIT).kind).toBe("operational");
+        expect(classifyMasterKey(withSigner(vectorInitialState, INITIAL.toLowerCase()), SPLIT).kind).toBe("initial");
+      });
+    });
+
+    it("reasons are non-empty only for other", () => {
+      const results = [
+        classifyMasterKey(cloneState(UNDEPLOYED_STATE), SPLIT),
+        classifyMasterKey(withSigner(vectorInitialState, INITIAL), SPLIT),
+        classifyMasterKey(withSigner(vectorOperationalState, OP_A), SPLIT),
+        classifyMasterKey(withSigner(vectorOperationalState, STRANGER), SPLIT),
+      ];
+      expect(results.map((r) => r.kind)).toEqual(["undeployed", "initial", "operational", "other"]);
+      results.forEach(expectReasons);
+    });
+
+    it("modifies neither state nor expected (classify and reconstruct)", () => {
+      const state = withSigner(vectorOperationalState, OP_B);
+      const before = cloneState(state);
+      const expected = split({ initial: INITIAL, operational: [OP_A, OP_B] });
+      const expectedBefore = JSON.parse(JSON.stringify(expected));
+      const p = params(xyPasskey(inputs.newPasskey), expected);
+      const pBefore = JSON.parse(JSON.stringify(p));
+
+      classifyMasterKey(state, expected);
+      reconstructOperationalMasterKey(state, p);
+      classifyMasterKey(withSigner(vectorOperationalState, STRANGER), expected);
+
+      expect(state).toEqual(before);
+      expect(expected).toEqual(expectedBefore);
+      expect(p).toEqual(pBefore);
+    });
+  });
+
+  describe("reconstructOperationalMasterKey", () => {
+    it.each([
+      ["OP_B", OP_B],
+      ["OP_A", OP_A],
+    ])("keeps the wallet's own on-chain cosigner (%s), not another one from the list", (_name, signer) => {
+      const out = reconstructOperationalMasterKey(withSigner(vectorOperationalState, signer), params(xyPasskey(inputs.newPasskey), SPLIT));
+      expect(decodeOperational(out).signer).toBe(signer);
+      expect(out).toBe(independentWithCosigner(signer));
+    });
+
+    it.each([
+      ["[cosigner]", [inputs.cosigner]],
+      ["[OP_A, cosigner, OP_B]", [OP_A, inputs.cosigner, OP_B]],
+      ["[OP_B, OP_A, cosigner]", [OP_B, OP_A, inputs.cosigner]],
+      ["[cosigner, OP_B, OP_A]", [inputs.cosigner, OP_B, OP_A]],
+    ])("rebuilds the fixture's reconstructedMaster with operational %s", (_name, operational) => {
+      const expected = split({ initial: INITIAL, operational });
+      expect(reconstructOperationalMasterKey(vectorOperationalState(), params(xyPasskey(inputs.newPasskey), expected))).toBe(
+        outputs.reconstructedMaster,
+      );
+    });
+
+    it("the on-chain signer in lower case or upper-case hex gives the same bytes", () => {
+      const p = params(xyPasskey(inputs.newPasskey), SPLIT);
+      const checksummed = reconstructOperationalMasterKey(withSigner(vectorOperationalState, OP_B), p);
+      expect(reconstructOperationalMasterKey(withSigner(vectorOperationalState, OP_B.toLowerCase()), p)).toBe(checksummed);
+      expect(reconstructOperationalMasterKey(withSigner(vectorOperationalState, upperHex(OP_B)), p)).toBe(checksummed);
+    });
+
+    it("rebuilds the original blob of the first 64 seeded random wallets", () => {
+      const rng = new Rng(0x5917);
+      for (const c of CASES.slice(0, 64)) {
+        const cosigner: MasterKeyCosigners = {
+          initial: rng.address(),
+          operational: [rng.address(), c.expected.cosigner as string, rng.address()],
+        };
+        const rebuilt = reconstructOperationalMasterKey(c.state, { ...c.expected, cosigner, passkey: c.passkey });
+        expect({ case: c.index, blob: rebuilt }).toEqual({ case: c.index, blob: c.original });
+      }
+    });
+
+    it.each<[string, () => OnchainKeyState, MasterKeyExpectation]>([
+      ["initial state", () => withSigner(vectorInitialState, INITIAL), SPLIT],
+      ["undeployed state", () => cloneState(UNDEPLOYED_STATE), SPLIT],
+      ["[1] not in the list", () => withSigner(vectorOperationalState, STRANGER), SPLIT],
+      ["[1] is the initial cosigner", () => withSigner(vectorOperationalState, INITIAL), SPLIT],
+      [
+        "overlapping expectation",
+        () => withSigner(vectorOperationalState, OP_A),
+        split({ initial: INITIAL, operational: [OP_A, INITIAL] }),
+      ],
+    ])("refuses: %s", (_name, state, expected) => {
+      expectRefused(state(), params(xyPasskey(inputs.newPasskey), expected));
     });
   });
 });

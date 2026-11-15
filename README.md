@@ -513,27 +513,37 @@ creator.setSignature([...MASTER_OP_KEY_INDEX_LIST], [zkSignature, cosignerSignat
 
 - `setUpdateKeysCallData`, `setUpdateMasterKeyCallData` and `setUpdateTxKeyCallData` set the signer key types to `[keyZkOAuthRS256, keyAddress]` (`MASTER_OP_SIGNER_KEY_TYPES`) unless you pass a second argument. For a wallet whose master key is still a zk key alone, pass `[PrimitiveAccountKeyTypes.keyZkOAuthRS256]`. The key types decide the `verificationGasLimit` that `autoFillUserOp()` computes.
 - Before `autoFillUserOp()`, install a dummy with the real signature's shape, as above. Its bytes equal `createDummyMasterOpSignature(n)` — `n` is 1 for the initial key, 3 for the operational key. The proof count in the dummy picks the zk verification budget, and its length is what `applyBundlerPreVerificationGas()` calibrates against.
-- `updateKeys` callGasLimit: with initCode (wallet not deployed yet) `ZkapBuilder.UPDATE_KEYS_CALL_GAS + GAS_BUFFER` = 1,825,000; on a deployed wallet the node's estimate × 1.2 + 25,000. Under-declaring reverts the execution on-chain and the op is still charged.
+- `updateKeys` callGasLimit: with initCode (wallet not deployed yet) `ZkapBuilder.UPDATE_KEYS_CALL_GAS + GAS_BUFFER` = 1,825,000; on a deployed wallet the node's estimate × 1.2 + 25,000. `updateMasterKey` on a deployed wallet gets the same estimate × 1.2 + 25,000. Under-declaring reverts the execution on-chain and the op is still charged.
 
 ### Classifying a wallet's master key
 
 ```typescript
+// One cosigner for both layouts:
 const expected = { contracts, cosigner: COSIGNER };
+// Or, when wallets are deployed with one cosigner and operated with another:
+const split = {
+  contracts,
+  cosigner: { initial: DEPLOYMENT_COSIGNER, operational: [OPERATING_COSIGNER_A, OPERATING_COSIGNER_B] },
+};
 const { kind, reasons, state } = await reader.classifyMasterKey(WALLET_ADDRESS, expected);
 ```
+
+`cosigner` is checked against the master key's `[1]` signer. As a string it must match in both layouts. As `{ initial, operational }` (`MasterKeyCosigners`), the initial master key's `[1]` must equal `initial` and the operational master key's `[1]` must be one of `operational`. A wallet's operational cosigner can be rotated, so different wallets may carry different entries of the list.
 
 | `kind` | Meaning |
 |---|---|
 | `"undeployed"` | No code at the address yet. |
-| `"initial"` | The initial master key with the expected contracts and cosigner, and no tx key — onboarding has not run. |
-| `"operational"` | The operational master key with the expected contracts and cosigner. Tx keys are not looked at. |
+| `"initial"` | The initial master key with the expected contracts and the initial cosigner (`cosigner`, or `cosigner.initial`), and no tx key — onboarding has not run. |
+| `"operational"` | The operational master key with the expected contracts and an operational cosigner (`cosigner`, or one of `cosigner.operational`). Tx keys are not looked at. |
 | `"other"` | Anything else, including a truncated read. `reasons` lists every failed condition with its expected and actual value. |
+
+If `operational` contains `initial`, the expectation cannot tell a deployment cosigner from an operating one. Such an expectation classifies every state as `"other"` — an undeployed account included — with a single `cosigner expectation: …` reason; it is reported rather than thrown, and reconstruction refuses it. A malformed split form (a non-address `initial`, an `operational` that is not a non-empty list of addresses) matches nothing, so a deployed wallet reads as `"other"`.
 
 A failed read throws `AaFetchError`; it is never reported as `"other"`. Addresses compare case-insensitively. `"operational"` checks the layout, not every value: such a state can still fail reconstruction when its on-chain anchor or `hAudList` is out of the builder's range. The pure function `classifyMasterKey(state, expected)` classifies a state you read with `readKeyState()`.
 
 ### Rebuilding the operational master key
 
-`reconstructOperationalMasterKey` rebuilds a wallet's operational master key with a new passkey at `[2]` — to replace a lost passkey, for example. `hAudList` and the anchor exist only on chain, so it takes them from the read state; contract addresses and the cosigner come from your parameters.
+`reconstructOperationalMasterKey` rebuilds a wallet's operational master key with a new passkey at `[2]` — to replace a lost passkey, for example. `hAudList` and the anchor exist only on chain, so it takes them from the read state; contract addresses come from your parameters. With a string `cosigner`, the cosigner at `[1]` is that address. With `{ initial, operational }`, the rebuilt key keeps the wallet's own on-chain `[1]` cosigner — which classification has confirmed is in `operational` — never another address from the list.
 
 ```typescript
 import {
@@ -584,7 +594,7 @@ builder.setSignature([...MASTER_OP_KEY_INDEX_LIST], [createDummyZkSignature(3), 
 
 **A wrong blob locks the wallet's master key for good** — it installs a master key no zk proof can satisfy. So:
 
-- It throws `AaOperationError` (`INPUT_INVALID`) unless the state classifies as `"operational"` against your `contracts` and `cosigner`. There are no defaults and no partial matches.
+- It throws `AaOperationError` (`INPUT_INVALID`) unless the state classifies as `"operational"` against your `contracts` and `cosigner` (either form). There are no defaults and no partial matches.
 - The result is valid only for the wallet at `state.account`. Submitted to any other wallet it locks that wallet's master key — check that the op's sender is `state.account`.
 - The result is only as current as the read. Use it right after reading, and re-check the wallet's key state before submitting; that check is yours.
 
