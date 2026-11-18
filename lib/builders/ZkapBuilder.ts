@@ -41,7 +41,16 @@ export class ZkapBuilder extends BaseAccountBuilder {
   // for contracts not yet deployed, empirically measured
   static readonly GAS_BUFFER = BigInt(25000);
 
-  static readonly ADDRESS_KEY_VALIDATION_GAS = 15000n;
+  /**
+   * Address key (ECDSA signer address, ecrecover).
+   * Measured on a local chain running EntryPoint v0.8, user-paid ops, smallest
+   * verificationGasLimit that validated (1-gas bisection, reproduced twice):
+   * one address-key signature 51,315; two address-key signatures 66,574.
+   * With the 25,000 base and x1.2 below, 15,000 gave 48,000 and 66,000 — both
+   * short (AA26). 25,000 gives 60,000 (x1.17) and 90,000 (x1.35).
+   * The second key added about 15,000; the first costs more, likely cold access.
+   */
+  static readonly ADDRESS_KEY_VALIDATION_GAS = 25000n;
   static readonly SECP256K1_KEY_VALIDATION_GAS = 15000n;  // secp256k1 ECDSA, ecrecover level
   static readonly SECP256R1_KEY_VALIDATION_GAS = 470000n; // P-256 ECDSA, similar to WebAuthn
   static readonly WEB_AUTHN_KEY_VALIDATION_GAS = 150000n; // mainnet-measured ~97k with the P256VERIFY precompile (EIP-7951) × 1.5 margin; was 470000n from the pre-precompile pure-Solidity path (~450k)

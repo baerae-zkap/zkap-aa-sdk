@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-18
+
+Raises the verification budget of an address key so that ops signed only by
+address keys pass validation.
+
+**Why:** on a local chain running EntryPoint v0.8, the smallest
+`verificationGasLimit` that validated a user-paid op was 51,315 with one
+address-key signature and 66,574 with two. With the previous budget,
+`autoFillUserOp()` set 48,000 and 66,000 — both below that, so the bundler
+rejects the op (`AA26`). Ops that also carry a zk or WebAuthn signature were
+covered by those keys' larger budgets.
+
+### Changed
+
+- **`ZkapBuilder.ADDRESS_KEY_VALIDATION_GAS`** is 25,000 (was 15,000). One
+  address key now gives a `verificationGasLimit` of 60,000 (1.17x the measured
+  minimum) and two give 90,000 (1.35x).
+- Cosigned master ops (`[keyZkOAuthRS256, keyAddress]`, the default of the
+  master-op setters) get 12,000 more: 540,000 with one proof (was 528,000) and
+  1,140,000 with three (was 1,128,000). Unused `verificationGasLimit` is not
+  charged; it only raises the required prefund.
+
+### Unchanged
+
+- Every other gas constant, the encoders, parsers, classification,
+  reconstruction, dummy signatures and the known-answer vectors.
+
 ## [0.3.1] - 2026-11-15
 
 Lets `classifyMasterKey` and `reconstructOperationalMasterKey` take a separate
