@@ -222,16 +222,16 @@ describe("ZkapBuilder gas profile (real ABI coding)", () => {
     ];
 
     describe.each(setters)("%s", (setter) => {
-      it("default key types, one proof: (25,000 + 400,000 + 15,000) * 1.2", async () => {
+      it("default key types, one proof: (25,000 + 400,000 + 25,000) * 1.2", async () => {
         const builder = await buildMasterOp(setter, cosignedSignature(1));
 
-        expect(BigInt(builder.getUserOp().verificationGasLimit)).toBe(528_000n);
+        expect(BigInt(builder.getUserOp().verificationGasLimit)).toBe(540_000n);
       });
 
-      it("default key types, three proofs: (25,000 + 900,000 + 15,000) * 1.2", async () => {
+      it("default key types, three proofs: (25,000 + 900,000 + 25,000) * 1.2", async () => {
         const builder = await buildMasterOp(setter, cosignedSignature(3));
 
-        expect(BigInt(builder.getUserOp().verificationGasLimit)).toBe(1_128_000n);
+        expect(BigInt(builder.getUserOp().verificationGasLimit)).toBe(1_140_000n);
       });
 
       it("explicit [zk] keeps the zk-only budgets", async () => {
@@ -264,8 +264,8 @@ describe("ZkapBuilder gas profile (real ABI coding)", () => {
         [createDummyCosignSignature(), createDummyZkSignature(1)],
       ]);
 
-      expect(BigInt(zkFirst.getUserOp().verificationGasLimit)).toBe(528_000n);
-      expect(BigInt(cosignFirst.getUserOp().verificationGasLimit)).toBe(1_128_000n);
+      expect(BigInt(zkFirst.getUserOp().verificationGasLimit)).toBe(540_000n);
+      expect(BigInt(cosignFirst.getUserOp().verificationGasLimit)).toBe(1_140_000n);
     });
 
     it("default key types are [keyZkOAuthRS256, keyAddress]", async () => {
@@ -276,6 +276,39 @@ describe("ZkapBuilder gas profile (real ABI coding)", () => {
       ]);
 
       expect(builder.getUserOp().verificationGasLimit).toBe(explicit.getUserOp().verificationGasLimit);
+    });
+  });
+
+  describe("verificationGasLimit of address-key ops", () => {
+    // Smallest verificationGasLimit that validated on a local EntryPoint v0.8 chain
+    // (user-paid, 1-gas bisection). The SDK budget must stay above these.
+    const MEASURED_MIN_ONE_ADDRESS_KEY = 51_315n;
+    const MEASURED_MIN_TWO_ADDRESS_KEYS = 66_574n;
+
+    const buildAddressKeyOp = async (keyCount: 1 | 2): Promise<ZkapBuilder> => {
+      const builder = new ZkapBuilder(accountInfo);
+      builder.setSender(SENDER);
+      builder.setNonce("0x1");
+      builder.setSignerKeyTypes(Array<number>(keyCount).fill(keyAddress));
+      builder.setCallData(CALL_DATA);
+      const indexes = keyCount === 1 ? [0] : [0, 1];
+      builder.setSignature(indexes, indexes.map(() => createDummyCosignSignature()));
+      await builder.autoFillUserOp();
+      return builder;
+    };
+
+    it("one address key: (25,000 + 25,000) * 1.2, above the measured minimum", async () => {
+      const vgl = BigInt((await buildAddressKeyOp(1)).getUserOp().verificationGasLimit);
+
+      expect(vgl).toBe(60_000n);
+      expect(vgl).toBeGreaterThan(MEASURED_MIN_ONE_ADDRESS_KEY);
+    });
+
+    it("two address keys: (25,000 + 2 * 25,000) * 1.2, above the measured minimum", async () => {
+      const vgl = BigInt((await buildAddressKeyOp(2)).getUserOp().verificationGasLimit);
+
+      expect(vgl).toBe(90_000n);
+      expect(vgl).toBeGreaterThan(MEASURED_MIN_TWO_ADDRESS_KEYS);
     });
   });
 
